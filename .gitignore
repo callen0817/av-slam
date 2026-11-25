@@ -1,0 +1,105 @@
+# ==========================================
+# AV-SLAM - .gitignore
+# ==========================================
+
+# ----- Heavy Third-Party Libraries & Binaries -----
+# (See EXCLUSIONS.md for local reconstruction instructions)
+zsign_src/build/windows/vs2022/lib/openssl/
+bin/
+*.exe
+*.lib
+*.a
+*.o
+*.dll
+*.so
+*.dylib
+!zsign_src/test/dylib/bin/*.dylib
+
+# ----- Intermediate Build Artifacts -----
+build/
+x64/
+[Dd]ebug/
+[Rr]elease/
+x86/
+[Bb]in/
+[Oo]bj/
+*.obj
+*.iobj
+*.ipdb
+*.pdb
+*.tlog
+*.idb
+*.ilk
+*.exp
+
+# ----- Hardware Packet Captures & Network Dumps -----
+# (See EXCLUSIONS.md for regeneration instructions via pktmon)
+*.etl
+*.pcapng
+air_capture*.txt
+netstat.txt
+
+# ----- iOS & Xcode Artifacts -----
+sdks/
+iPhoneOS.sdk.zip
+.zsign_cache/
+.zsign_debug/
+
+# Local Blender scratch scripts, test logs, and intermediate STL/PNG renders
+*.stl
+*.png
+!ios/AVScan/Assets/*.png
+!docs/assets/*.png
+blender_*.txt
+test_stdout.txt
+enclosure_outputs/
+build_kdd_airy_mount.py
+build_v2_enclosures.py
+generate_all_enclosures.py
+inspect_blender.py
+perfect_studio.py
+rebuild_logo_3d.py
+render_assembly_studio.py
+DerivedData/
+*.xcworkspace
+!*.xcworkspace/contents.xcworkspacedata
+*.xcodeproj/project.xcworkspace/
+*.xcodeproj/xcuserdata/
+xcuserdata/
+*.xcuserstate
+*.moved-aside
+*.xcarchive
+*.ipa
+*.app
+*.dSYM/
+
+# ----- Visual Studio & IDE State -----
+.vs/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# ----- General OS & Temporary Files -----
+.DS_Store
+Thumbs.db
+desktop.ini
+*.log
+*.tmp
+*.bak
+*.swp
+*.swo
+
+# Signing secrets
+certs/
+*.p12
+*.key
+*.pem
+*.mobileprovision
+*.certSigningRequest
+*.cer
+p12_password.txt
+
+# Local multi-hundred-MB raw LiDAR captures for regression replays
+tests/live scans/
+*.avraw
