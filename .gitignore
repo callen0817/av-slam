@@ -103,3 +103,5 @@ p12_password.txt
 # Local multi-hundred-MB raw LiDAR captures for regression replays
 tests/live scans/
 *.avraw
+AV_SLAM_Projects/
+

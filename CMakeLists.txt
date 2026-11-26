@@ -8,6 +8,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(AVSLAM_BUILD_TESTS "Build automated unit, integration, and regression tests" ON)
 option(AVSLAM_BUILD_IOS_APP "Build native iOS/iPadOS AV SLAM application target" OFF)
+option(AVSLAM_BUILD_DESKTOP_APP "Build native Windows/Linux/Jetson AV SLAM Desktop GUI application" OFF)
 option(AVSLAM_BUILD_AB_BENCHMARK "Build host-only A/B benchmark comparing AV-SLAM against legacy FastLivo2Engine" ON)
 
 if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
@@ -163,5 +164,60 @@ if(AVSLAM_BUILD_TESTS AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
         target_link_libraries(avslam_ab_benchmark PRIVATE avslam_core)
         target_compile_definitions(avslam_ab_benchmark PRIVATE AVSCAN_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
         add_test(NAME AVSlamVsFastLivo2Benchmark COMMAND avslam_ab_benchmark)
+    endif()
+endif()
+
+# Native Windows & Linux/Jetson Desktop GUI Application (GLFW + OpenGL + Dear ImGui)
+# Replaces standalone av-scanar with the 100% proprietary avslam_core engine!
+if(AVSLAM_BUILD_DESKTOP_APP AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    include(FetchContent)
+    find_package(OpenGL REQUIRED)
+
+    set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+    set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    FetchContent_Declare(
+        glfw
+        GIT_REPOSITORY https://github.com/glfw/glfw.git
+        GIT_TAG 3.4
+        GIT_SHALLOW TRUE
+    )
+    FetchContent_Declare(
+        imgui
+        GIT_REPOSITORY https://github.com/ocornut/imgui.git
+        GIT_TAG v1.91.5
+        GIT_SHALLOW TRUE
+    )
+    FetchContent_MakeAvailable(glfw imgui)
+
+    add_executable(AVSlamDesktop
+        desktop/AVSlamDesktopApp.cpp
+        desktop/DesktopSessionController.cpp
+        desktop/DesktopCameraCapture.cpp
+        ${imgui_SOURCE_DIR}/imgui.cpp
+        ${imgui_SOURCE_DIR}/imgui_draw.cpp
+        ${imgui_SOURCE_DIR}/imgui_tables.cpp
+        ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+        ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
+        ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl2.cpp
+    )
+
+    target_include_directories(AVSlamDesktop PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/desktop
+        ${imgui_SOURCE_DIR}
+        ${imgui_SOURCE_DIR}/backends
+    )
+
+    target_link_libraries(AVSlamDesktop PRIVATE
+        avslam_core
+        glfw
+        OpenGL::GL
+    )
+
+    if(WIN32)
+        target_link_libraries(AVSlamDesktop PRIVATE mf mfplat mfreadwrite mfuuid ole32)
+    elseif(UNIX AND NOT APPLE)
+        target_link_libraries(AVSlamDesktop PRIVATE pthread dl)
     endif()
 endif()
