@@ -112,6 +112,12 @@ void rebuildLiveVoxelIndex(
     uint64_t _scanStartCamFrames;
     BOOL _cameraWatchdogKicked;
     avscan::processing::CleanupStats _lastCleanupStats;
+
+    std::unique_ptr<avscan::cslam::CollaborativeSlamEngine> _cslamEngine;
+    std::unique_ptr<avscan::cslam::CollaborativeLanTransport> _cslamLanTransport;
+    MultipeerCollabTransport *_multipeerTransport;
+    std::atomic<bool> _cslamBeaconRunning;
+    std::thread _cslamBeaconThread;
 }
 
 - (instancetype)init {
@@ -130,6 +136,18 @@ void rebuildLiveVoxelIndex(
         _scanStartHostTime = 0.0;
         _scanStartCamFrames = 0;
         _cameraWatchdogKicked = NO;
+        _isCslamEnabled = NO;
+        _cslamBeaconRunning = false;
+
+        NSString *devName = [[UIDevice currentDevice] name] ?: @"AV-SLAM-Node";
+        NSString *agentId = [[[[UIDevice currentDevice] identifierForVendor] UUIDString] substringToIndex:8] ?: @"avslam_node";
+        _cslamEngine = std::make_unique<avscan::cslam::CollaborativeSlamEngine>(
+            std::string("avslam_") + agentId.UTF8String,
+            devName.UTF8String,
+            avscan::cslam::PeerPlatform::IOS,
+            avscan::cslam::PeerApp::AV_SLAM);
+        _cslamLanTransport = std::make_unique<avscan::cslam::CollaborativeLanTransport>();
+        _multipeerTransport = [[MultipeerCollabTransport alloc] initWithDisplayName:devName];
 
         // Strict planar GICP gate for live SLAM loop verification (reject centroid-fallback false positives)
         avscan::backend::GicpVerificationConfig gicpCfg;
@@ -861,6 +879,18 @@ void rebuildLiveVoxelIndex(
 
             _latestFloorPlan = avscan::quality::QualityMonitor::generateLiveFloorPlan(
                 _cachedGlobalCloud, _poseGraph.getSubmaps(), _poseGraph.getFactors(), 0.10);
+
+            // Collaborative SLAM: register local keyframe and broadcast to connected iOS / Jetson / Windows peers
+            if (_isCslamEnabled && _cslamEngine) {
+                _cslamEngine->addLocalKeyframe(submap, scDesc);
+                auto kfPkt = _cslamEngine->serializeKeyframeSync(submap, scDesc, 1200);
+                if (_cslamLanTransport && _cslamLanTransport->isRunning()) {
+                    _cslamLanTransport->broadcastTcpPacket(kfPkt);
+                }
+                if (_multipeerTransport && _multipeerTransport.isRunning) {
+                    [_multipeerTransport broadcastData:kfPkt reliable:YES];
+                }
+            }
         }
     }
 }
@@ -1167,15 +1197,150 @@ void rebuildLiveVoxelIndex(
         }
         return statPts;
     }
-    if (!_cachedGlobalCloud.empty()) {
-        return _cachedGlobalCloud;
+    std::vector<avscan::core::LidarPointXYZIRT> baseCloud = !_cachedGlobalCloud.empty() ? _cachedGlobalCloud : _livePreviewCloud;
+    if (_isCslamEnabled && _cslamEngine) {
+        auto peerPts = _cslamEngine->buildAlignedPeerPointCloud(100000);
+        if (!peerPts.empty()) {
+            baseCloud.insert(baseCloud.end(), peerPts.begin(), peerPts.end());
+        }
     }
-    return _livePreviewCloud;
+    return baseCloud;
 }
 
 - (std::vector<avscan::core::SlamState>)currentTrajectory {
     std::lock_guard<std::mutex> lock(_stateMutex);
-    return _slamEngine.getTrajectory();
+    auto traj = _slamEngine.getTrajectory();
+    if (_isCslamEnabled && _cslamEngine) {
+        auto peerTraj = _cslamEngine->getAlignedPeerTrajectories();
+        if (!peerTraj.empty()) {
+            traj.insert(traj.end(), peerTraj.begin(), peerTraj.end());
+        }
+    }
+    return traj;
+}
+
+#pragma mark - Collaborative SLAM (C-SLAM) & Depth Compute Tier
+
+- (BOOL)setCollaborativeSlamEnabled:(BOOL)enabled {
+    if (enabled == _isCslamEnabled) return YES;
+    if (enabled) {
+        AVScanCoreBridge * __weak weakSelf = self;
+        _cslamLanTransport->setPacketCallback([weakSelf](const uint8_t *data, size_t len, const std::string &senderIp) {
+            AVScanCoreBridge *strongSelf = weakSelf;
+            if (!strongSelf || !strongSelf->_cslamEngine) return;
+            strongSelf->_cslamEngine->ingestRemotePacket(data, len, senderIp, CACurrentMediaTime());
+        });
+        [_multipeerTransport setPacketCallback:[weakSelf](const uint8_t *data, size_t len, const std::string &senderLabel) {
+            AVScanCoreBridge *strongSelf = weakSelf;
+            if (!strongSelf || !strongSelf->_cslamEngine) return;
+            strongSelf->_cslamEngine->ingestRemotePacket(data, len, senderLabel, CACurrentMediaTime());
+        } peerCallback:[weakSelf](const std::string &agentId, const std::string &displayName) {
+            AVScanCoreBridge *strongSelf = weakSelf;
+            if (!strongSelf || !strongSelf->_cslamEngine) return;
+            strongSelf->_cslamEngine->registerExternalPeer(
+                agentId, displayName, avscan::cslam::PeerPlatform::IOS, avscan::cslam::PeerApp::AV_IOS, "Bluetooth/P2P Wi-Fi", CACurrentMediaTime());
+        }];
+
+        _cslamLanTransport->start();
+        [_multipeerTransport start];
+        _isCslamEnabled = YES;
+
+        _cslamBeaconRunning.store(true);
+        _cslamBeaconThread = std::thread([weakSelf]() {
+            while (true) {
+                AVScanCoreBridge *strongSelf = weakSelf;
+                if (!strongSelf || !strongSelf->_cslamBeaconRunning.load()) break;
+
+                avscan::math::SE3d pose;
+                uint32_t kfCount = 0;
+                {
+                    std::lock_guard<std::mutex> lock(strongSelf->_stateMutex);
+                    pose = strongSelf->_slamEngine.getCurrentState().T_world_body;
+                    kfCount = static_cast<uint32_t>(strongSelf->_poseGraph.getSubmaps().size());
+                }
+                auto beacon = strongSelf->_cslamEngine->serializeBeacon(pose, kfCount);
+                if (strongSelf->_cslamLanTransport && strongSelf->_cslamLanTransport->isRunning()) {
+                    strongSelf->_cslamLanTransport->broadcastUdpPacket(beacon);
+                }
+                if (strongSelf->_multipeerTransport && strongSelf->_multipeerTransport.isRunning) {
+                    [strongSelf->_multipeerTransport broadcastData:beacon reliable:NO];
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+            }
+        });
+    } else {
+        _isCslamEnabled = NO;
+        if (_cslamBeaconRunning.exchange(false)) {
+            if (_cslamBeaconThread.joinable()) _cslamBeaconThread.join();
+        }
+        if (_cslamLanTransport) _cslamLanTransport->stop();
+        [_multipeerTransport stop];
+    }
+    return YES;
+}
+
+- (void)connectCollaborativePeerByIp:(NSString *)ipAddress {
+    if (ipAddress.length == 0) return;
+    if (!_isCslamEnabled) {
+        [self setCollaborativeSlamEnabled:YES];
+    }
+    if (_cslamLanTransport) {
+        _cslamLanTransport->addDirectPeerIp(ipAddress.UTF8String);
+        avscan::math::SE3d pose;
+        uint32_t kfCount = 0;
+        {
+            std::lock_guard<std::mutex> lock(_stateMutex);
+            pose = _slamEngine.getCurrentState().T_world_body;
+            kfCount = static_cast<uint32_t>(_poseGraph.getSubmaps().size());
+        }
+        auto beacon = _cslamEngine->serializeBeacon(pose, kfCount);
+        _cslamLanTransport->broadcastUdpPacket(beacon);
+    }
+}
+
+- (void)syncSharedOriginWithPeers {
+    if (!_cslamEngine) return;
+    _cslamEngine->syncSharedOriginWithAllPeers();
+    auto pkt = _cslamEngine->serializeSharedOriginSync();
+    if (_cslamLanTransport && _cslamLanTransport->isRunning()) {
+        _cslamLanTransport->broadcastUdpPacket(pkt);
+        _cslamLanTransport->broadcastTcpPacket(pkt);
+    }
+    if (_multipeerTransport && _multipeerTransport.isRunning) {
+        [_multipeerTransport broadcastData:pkt reliable:YES];
+    }
+}
+
+- (NSArray<NSDictionary<NSString *, id> *> *)connectedCollaborativePeers {
+    if (!_cslamEngine) return @[];
+    auto peers = _cslamEngine->getPeers(CACurrentMediaTime(), 20.0);
+    NSMutableArray *arr = [NSMutableArray arrayWithCapacity:peers.size()];
+    for (const auto &p : peers) {
+        [arr addObject:@{
+            @"id": [NSString stringWithUTF8String:p.agent_id.c_str()],
+            @"name": [NSString stringWithUTF8String:p.display_name.c_str()],
+            @"ip": [NSString stringWithUTF8String:p.ip_address.c_str()],
+            @"platform": [NSString stringWithUTF8String:avscan::cslam::CollaborativeSlamEngine::platformToString(p.platform).c_str()],
+            @"app": [NSString stringWithUTF8String:avscan::cslam::CollaborativeSlamEngine::appToString(p.app).c_str()],
+            @"connected": @(p.connected),
+            @"aligned": @(p.aligned),
+            @"keyframes": @(p.keyframe_count)
+        }];
+    }
+    return arr;
+}
+
+- (avscan::cslam::CslamStats)collaborativeSlamStats {
+    return _cslamEngine ? _cslamEngine->getStats() : avscan::cslam::CslamStats{};
+}
+
+- (avscan::sensors::DepthComputeTier)recommendedDepthComputeTier {
+    struct utsname sysInfo {};
+    std::string machine = "Generic";
+    if (uname(&sysInfo) == 0 && sysInfo.machine[0]) {
+        machine = sysInfo.machine;
+    }
+    return avscan::sensors::LidarAnchoredDepthAligner::computeTierForHardware(machine);
 }
 
 - (size_t)loopClosureCount {

@@ -21,8 +21,11 @@ set(AVSLAM_CORE_SOURCES
     src/sensors/AiryDiscovery.cpp
     src/sensors/AiryDecoder.cpp
     src/sensors/AiryUdpReceiver.cpp
+    src/sensors/DepthProviderRegistry.cpp
     src/sensors/LivoxMid360Adapter.cpp
     src/sensors/OusterAdapter.cpp
+    src/cslam/CollaborativeSlamEngine.cpp
+    src/cslam/CollaborativeTransport.cpp
     src/sync/TimeSynchronizer.cpp
     src/filters/PointCloudFilters.cpp
     src/processing/PointCloudCleanup.cpp
@@ -67,6 +70,7 @@ if(AVSLAM_BUILD_IOS_APP)
         ios/AVScan/AppDelegate.mm
         ios/AVScan/Bridge/AVScanCoreBridge.mm
         ios/AVScan/Sensors/CameraCaptureManager.mm
+        ios/AVScan/Sensors/MultipeerCollabTransport.mm
         ios/AVScan/Rendering/MetalPointCloudRenderer.mm
         ios/AVScan/UI/MainScannerViewController.mm
         ios/AVScan/UI/DiagnosticsViewController.mm
@@ -99,6 +103,7 @@ if(AVSLAM_BUILD_IOS_APP)
         "-framework CoreGraphics"
         "-framework QuartzCore"
         "-framework Network"
+        "-framework MultipeerConnectivity"
         "-framework SystemConfiguration"
         "-framework UniformTypeIdentifiers"
         "-lsqlite3"
@@ -138,6 +143,10 @@ if(AVSLAM_BUILD_TESTS AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
     add_executable(avslam_terrestrial_test tests/test_terrestrial_mode.cpp)
     target_link_libraries(avslam_terrestrial_test PRIVATE avslam_core)
     add_test(NAME TerrestrialModeTest COMMAND avslam_terrestrial_test)
+
+    add_executable(avslam_cslam_depth_test tests/test_cslam_and_depth.cpp)
+    target_link_libraries(avslam_cslam_depth_test PRIVATE avslam_core)
+    add_test(NAME CslamAndDepthTest COMMAND avslam_cslam_depth_test)
 
     add_executable(avslam_live_regression_test tests/test_live_scan_regression.cpp)
     target_link_libraries(avslam_live_regression_test PRIVATE avslam_core)

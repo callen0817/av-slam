@@ -2,6 +2,7 @@
 
 #import <Foundation/Foundation.h>
 #import "../Sensors/CameraCaptureManager.h"
+#import "../Sensors/MultipeerCollabTransport.h"
 #include "avscan/backend/GicpVerifier.hpp"
 #include "avscan/backend/PoseGraphOptimizer.hpp"
 #include "avscan/backend/ScanContext.hpp"
@@ -9,6 +10,8 @@
 #include "avscan/calibration/TargetlessCalibrator.hpp"
 #include "avscan/core/DeviceMountProfile.hpp"
 #include "avscan/core/Types.hpp"
+#include "avscan/cslam/CollaborativeSlamEngine.hpp"
+#include "avscan/cslam/CollaborativeTransport.hpp"
 #include "avscan/export/AvSpatialBundleExporter.hpp"
 #include "avscan/export/PointCloudExporter.hpp"
 #include "avscan/filters/PointCloudFilters.hpp"
@@ -16,6 +19,7 @@
 #include "avscan/quality/QualityMonitor.hpp"
 #include "avscan/sensors/AiryDiscovery.hpp"
 #include "avscan/sensors/AiryUdpReceiver.hpp"
+#include "avscan/sensors/IDepthProvider.hpp"
 #include "avscan/sensors/SensorRigProfile.hpp"
 #include "avscan/slam/AvSlamEngine.hpp"
 #include "avscan/storage/ProjectStore.hpp"
@@ -42,6 +46,7 @@ typedef NS_ENUM(NSInteger, AVMotorVerificationStatus) {
 @property (nonatomic, assign, readonly) BOOL isScanning;
 @property (nonatomic, assign, readonly) BOOL isTerrestrialStationActive;
 @property (nonatomic, assign, readonly) BOOL isSlamPausedForStation;
+@property (nonatomic, assign, readonly) BOOL isCslamEnabled;
 @property (nonatomic, copy, readonly) NSString *activeProjectId;
 @property (nonatomic, copy, readonly) NSString *activeProjectName;
 @property (nonatomic, copy, readonly) NSString *activeProjectDir;
@@ -98,6 +103,14 @@ typedef NS_ENUM(NSInteger, AVMotorVerificationStatus) {
 - (BOOL)isTerrestrialStationary;
 - (avscan::terrestrial::TerrestrialCaptureState)currentTerrestrialCaptureState;
 - (avscan::terrestrial::TerrestrialStationMetadata)currentTerrestrialStationMetadata;
+
+// Collaborative SLAM (C-SLAM) Multi-Device Peer Networking (iOS / Jetson / Windows)
+- (BOOL)setCollaborativeSlamEnabled:(BOOL)enabled;
+- (void)connectCollaborativePeerByIp:(NSString *)ipAddress;
+- (void)syncSharedOriginWithPeers;
+- (NSArray<NSDictionary<NSString *, id> *> *)connectedCollaborativePeers;
+- (avscan::cslam::CslamStats)collaborativeSlamStats;
+- (avscan::sensors::DepthComputeTier)recommendedDepthComputeTier;
 
 // Diagnostics & State Access
 - (avscan::sensors::AiryDiscoveryReport)runAiryDiagnostics;

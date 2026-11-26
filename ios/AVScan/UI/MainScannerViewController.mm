@@ -24,6 +24,7 @@
     UIBarButtonItem *_glassOpacityItem;
     UIBarButtonItem *_deviceProfileItem;
     UIBarButtonItem *_projectPickerItem;
+    UIBarButtonItem *_cslamConnectItem;
 
     NSTimer *_uiTimer;
     CGPoint _lastPanPt;
@@ -134,7 +135,11 @@
                                                           style:UIBarButtonItemStylePlain
                                                          target:self
                                                          action:@selector(openProjectScanMenu)];
-    self.navigationItem.leftBarButtonItems = @[badgeItem, _projectPickerItem];
+    _cslamConnectItem = [[UIBarButtonItem alloc] initWithTitle:@"Connect"
+                                                         style:UIBarButtonItemStylePlain
+                                                        target:self
+                                                        action:@selector(openCslamConnectMenu)];
+    self.navigationItem.leftBarButtonItems = @[badgeItem, _projectPickerItem, _cslamConnectItem];
     [self updateProjectButtonTitle];
 
     // 2. Right Bar Buttons: Glass Opacity Pill + Device Profile + Airy Diagnostics + Calibration
@@ -824,7 +829,99 @@
     [self.navigationController pushViewController:vc animated:YES];
 }
 
+#pragma mark - Collaborative SLAM (C-SLAM) Device Connection UI
+
+- (void)updateCslamButtonTitle {
+    if (!_bridge.isCslamEnabled) {
+        _cslamConnectItem.title = @"Connect";
+        return;
+    }
+    auto stats = [_bridge collaborativeSlamStats];
+    _cslamConnectItem.title = [NSString stringWithFormat:@"C-SLAM (%zu)", stats.discovered_peers];
+}
+
+- (void)openCslamConnectMenu {
+    NSArray<NSDictionary<NSString *, id> *> *peers = [_bridge connectedCollaborativePeers];
+    NSMutableString *msg = [NSMutableString string];
+    if (_bridge.isCslamEnabled) {
+        [msg appendFormat:@"C-SLAM ACTIVE (Bluetooth + Wi-Fi Ports 48765/48766)\nCompatible: AV Scan iOS · AV SLAM · AV Scanar · AV Scan\n"];
+    } else {
+        [msg appendString:@"C-SLAM OFF — Enable to discover nearby iPads/iPhones (Bluetooth + P2P Wi-Fi) and Jetson/Windows devices (LAN Wi-Fi).\n"];
+    }
+    if (peers.count > 0) {
+        [msg appendString:@"\nDiscovered Devices:\n"];
+        for (NSDictionary *p in peers) {
+            BOOL aligned = [p[@"aligned"] boolValue];
+            [msg appendFormat:@"• %@ [%@ · %@] — %@ (%@ KFs)\n",
+                p[@"name"], p[@"platform"], p[@"app"],
+                aligned ? @"ALIGNED" : @"SYNCING", p[@"keyframes"]];
+        }
+    } else if (_bridge.isCslamEnabled) {
+        [msg appendString:@"\nSearching for peers over Bluetooth & Wi-Fi..."];
+    }
+
+    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"Collaborative SLAM (C-SLAM)"
+                                                                   message:msg
+                                                            preferredStyle:UIAlertControllerStyleActionSheet];
+    sheet.popoverPresentationController.barButtonItem = _cslamConnectItem;
+
+    MainScannerViewController * __weak weakSelf = self;
+    NSString *toggleTitle = _bridge.isCslamEnabled ? @"Disconnect C-SLAM" : @"Enable C-SLAM (Bluetooth + Wi-Fi)";
+    [sheet addAction:[UIAlertAction actionWithTitle:toggleTitle
+                                              style:(_bridge.isCslamEnabled ? UIAlertActionStyleDestructive : UIAlertActionStyleDefault)
+                                            handler:^(UIAlertAction *action) {
+        MainScannerViewController *strongSelf = weakSelf;
+        if (!strongSelf) return;
+        [strongSelf->_bridge setCollaborativeSlamEnabled:!strongSelf->_bridge.isCslamEnabled];
+        [strongSelf updateCslamButtonTitle];
+    }]];
+
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Connect Device by IP (Jetson / Windows / iOS)..."
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *action) {
+        [weakSelf promptConnectPeerByIp];
+    }]];
+
+    if (_bridge.isCslamEnabled) {
+        [sheet addAction:[UIAlertAction actionWithTitle:@"Sync Shared Origin with Connected Peers"
+                                                  style:UIAlertActionStyleDefault
+                                                handler:^(UIAlertAction *action) {
+            MainScannerViewController *strongSelf = weakSelf;
+            if (strongSelf) [strongSelf->_bridge syncSharedOriginWithPeers];
+        }]];
+    }
+
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Close" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:sheet animated:YES completion:nil];
+}
+
+- (void)promptConnectPeerByIp {
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Connect C-SLAM Device by IP"
+                                                                   message:@"Enter the Wi-Fi IP of an iPad/iPhone, Jetson (AV SLAM / AV Scanar), or Windows PC (AV Scan):"
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.placeholder = @"e.g. 192.168.1.50 or 172.20.10.2";
+        tf.keyboardType = UIKeyboardTypeNumbersAndPunctuation;
+    }];
+
+    MainScannerViewController * __weak weakSelf = self;
+    [alert addAction:[UIAlertAction actionWithTitle:@"Connect"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *action) {
+        MainScannerViewController *strongSelf = weakSelf;
+        if (!strongSelf) return;
+        NSString *ip = [alert.textFields.firstObject.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (ip.length > 0) {
+            [strongSelf->_bridge connectCollaborativePeerByIp:ip];
+            [strongSelf updateCslamButtonTitle];
+        }
+    }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
 - (void)onUiRefreshTick {
+    [self updateCslamButtonTitle];
     auto cloud = [_bridge latestGlobalPointCloud];
     auto traj = [_bridge currentTrajectory];
     [_renderer updatePointCloud:cloud trajectory:traj];

@@ -80,7 +80,14 @@
     <key>NSCameraUseExternalDeviceType</key>
     <true/>
     <key>NSLocalNetworkUsageDescription</key>
-    <string>AV SLAM communicates over wired USB-C Ethernet with external LiDAR sensors (RoboSense Airy, Livox Mid-360, Ouster OS0/OS1) over UDP.</string>
+    <string>AV SLAM communicates over wired USB-C Ethernet with external LiDAR sensors (RoboSense Airy, Livox Mid-360, Ouster OS0/OS1) and discovers nearby C-SLAM devices (iOS, Jetson, Windows) over Wi-Fi for real-time collaborative mapping.</string>
+    <key>NSBluetoothAlwaysUsageDescription</key>
+    <string>AV SLAM uses Bluetooth for peer-to-peer C-SLAM device discovery and motorized terrestrial head control.</string>
+    <key>NSBonjourServices</key>
+    <array>
+        <string>_avcslam._tcp</string>
+        <string>_avcslam._udp</string>
+    </array>
     <key>UIFileSharingEnabled</key>
     <true/>
     <key>LSSupportsOpeningDocumentsInPlace</key>
