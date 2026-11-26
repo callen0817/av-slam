@@ -256,15 +256,24 @@ bool AvSlamEngine::initializeImuGravity(const std::vector<core::ImuMeasurement>&
         return false;
     }
 
+    // Sort by angular rate and average the quietest 50% of samples so startup finger-tap jitter
+    // never tilts initial gravity or suppresses gyro bias / accel scale calibration on handheld rigs.
+    std::vector<size_t> order(init_imu_accum_.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        return init_imu_accum_[a].gyro_rads.norm() < init_imu_accum_[b].gyro_rads.norm();
+    });
+    const size_t quiet_n = std::max<size_t>(10, init_imu_accum_.size() / 2);
     math::Vec3d mean_acc(0.0, 0.0, 0.0);
     math::Vec3d mean_gyro(0.0, 0.0, 0.0);
-    double max_gyro = 0.0;
-    for (const auto& m : init_imu_accum_) {
+    double quiet_max_gyro = 0.0;
+    for (size_t k = 0; k < quiet_n; ++k) {
+        const auto& m = init_imu_accum_[order[k]];
         mean_acc += m.accel_mps2;
         mean_gyro += m.gyro_rads;
-        max_gyro = std::max(max_gyro, m.gyro_rads.norm());
+        quiet_max_gyro = std::max(quiet_max_gyro, m.gyro_rads.norm());
     }
-    const double inv_n = 1.0 / static_cast<double>(init_imu_accum_.size());
+    const double inv_n = 1.0 / static_cast<double>(quiet_n);
     mean_acc *= inv_n;
     mean_gyro *= inv_n;
 
@@ -285,7 +294,7 @@ bool AvSlamEngine::initializeImuGravity(const std::vector<core::ImuMeasurement>&
         state_.T_world_body = math::SE3d(R_wb, math::Vec3d(0.0, 0.0, 0.0));
         state_.gravity_mps2 = math::Vec3d(0.0, 0.0, -kGravityMag);
 
-        if (max_gyro < 0.05) {
+        if (quiet_max_gyro < 0.18) {
             preintegrator_.setAccelScale(kGravityMag / acc_norm);
             state_.bias_gyro_rads = mean_gyro;
             state_.bias_accel_mps2 = {0.0, 0.0, 0.0};
@@ -1158,6 +1167,19 @@ bool AvSlamEngine::processSingleSweep(const sync::SyncBundle& bundle,
     solveJointMapOptimization(feats_body, preint, pyr_ptr, patches_ptr, out_metrics);
     const auto t_solve_1 = std::chrono::steady_clock::now();
 
+    // Gentle stationary ZUPT velocity damping to prevent micro-drift while holding rig steady
+    if (bundle.imu_measurements.size() >= 4 && state_.velocity_mps.norm() < 0.25) {
+        double max_w = 0.0;
+        double max_acc_dev = 0.0;
+        for (const auto& m : bundle.imu_measurements) {
+            max_w = std::max(max_w, (m.gyro_rads - state_.bias_gyro_rads).norm());
+            max_acc_dev = std::max(max_acc_dev, std::abs(m.accel_mps2.norm() - kGravityMag));
+        }
+        if (max_w < 0.04 && max_acc_dev < 0.35) {
+            state_.velocity_mps *= 0.25;
+        }
+    }
+
     // Rigidly align sweep motion knots to optimized sweep-end pose for sub-ms SLERP RGB colorization
     const math::SE3d T_corr = state_.T_world_body * T_wb_prop_end.inverse();
     for (auto& knot : motion_knots) {
@@ -1223,11 +1245,13 @@ bool AvSlamEngine::processSingleSweep(const sync::SyncBundle& bundle,
         out_world_frame.points.swap(static_world);
     }
 
-    // 8. Keyframe emission criteria
+    // 8. Keyframe emission criteria (require >= 2 warmup sweeps so Keyframe 0 is always settled & registered)
     if (!has_first_keyframe_) {
-        last_keyframe_pose_ = state_.T_world_body;
-        has_first_keyframe_ = true;
-        out_metrics.keyframe_emitted = true;
+        if (trajectory_.size() >= 2) {
+            last_keyframe_pose_ = state_.T_world_body;
+            has_first_keyframe_ = true;
+            out_metrics.keyframe_emitted = true;
+        }
     } else {
         const math::SE3d dT = last_keyframe_pose_.inverse() * state_.T_world_body;
         const double trans_dist = dT.t.norm();
