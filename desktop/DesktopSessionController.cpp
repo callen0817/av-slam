@@ -203,6 +203,32 @@ void DesktopSessionController::refreshDetectedHardware() {
         airy_ok = diag.adapter_detected || diag.difop_received || diag.http_reachable;
     }
     hw_manager_.refreshConnectedHardware(airy_ok, net_config_.sensor_ip);
+    refreshCachedSensorLists();
+}
+
+void DesktopSessionController::refreshCachedSensorLists() {
+    auto cams = camera_.enumerateCameraNames();
+    std::vector<DetectedImuInfo> imus;
+    auto is_ports = inertial_sense_.enumerateCandidatePorts();
+    if (!is_ports.empty()) {
+        imus.push_back({"inertial_sense_imu",
+                        "Inertial Sense uINS-3 / IMX-5 Dual RTK IMU (" + is_ports.front().port_name + ")",
+                        120, true});
+    } else {
+        imus.push_back({"inertial_sense_imu",
+                        "Inertial Sense uINS-3 / IMX-5 Dual RTK IMU (Auto Serial)",
+                        120, true});
+    }
+    imus.push_back({"airy_imu", "RoboSense Airy 200Hz IMU (Ethernet)", 100, true});
+    auto host_imus = host_imu_.enumerateAvailableImus();
+    imus.insert(imus.end(), host_imus.begin(), host_imus.end());
+    std::sort(imus.begin(), imus.end(), [](const DetectedImuInfo& a, const DetectedImuInfo& b) {
+        return a.priority > b.priority;
+    });
+
+    std::lock_guard<std::mutex> lk(device_cache_mutex_);
+    cached_camera_names_ = std::move(cams);
+    cached_imu_sources_ = std::move(imus);
 }
 
 DesktopSessionController::~DesktopSessionController() {
@@ -504,25 +530,14 @@ void DesktopSessionController::setImuSelection(SensorSelectionMode mode, const s
     sensor_toggles_.imu_source_id = (mode == SensorSelectionMode::ENABLED_SPECIFIC) ? imu_id : "";
 }
 
+std::vector<std::string> DesktopSessionController::availableCameraNames() const {
+    std::lock_guard<std::mutex> lk(device_cache_mutex_);
+    return cached_camera_names_;
+}
+
 std::vector<DetectedImuInfo> DesktopSessionController::availableImuSources() const {
-    std::vector<DetectedImuInfo> out;
-    auto is_ports = inertial_sense_.enumerateCandidatePorts();
-    if (!is_ports.empty()) {
-        out.push_back({"inertial_sense_imu",
-                       "Inertial Sense uINS-3 / IMX-5 Dual RTK IMU (" + is_ports.front().port_name + ")",
-                       120, true});
-    } else {
-        out.push_back({"inertial_sense_imu",
-                       "Inertial Sense uINS-3 / IMX-5 Dual RTK IMU (Auto Serial)",
-                       120, true});
-    }
-    out.push_back({"airy_imu", "RoboSense Airy 200Hz IMU (Ethernet)", 100, true});
-    auto host_imus = host_imu_.enumerateAvailableImus();
-    out.insert(out.end(), host_imus.begin(), host_imus.end());
-    std::sort(out.begin(), out.end(), [](const DetectedImuInfo& a, const DetectedImuInfo& b) {
-        return a.priority > b.priority;
-    });
-    return out;
+    std::lock_guard<std::mutex> lk(device_cache_mutex_);
+    return cached_imu_sources_;
 }
 
 std::string DesktopSessionController::primaryGeometryStatusSummary() const {
@@ -617,6 +632,21 @@ bool DesktopSessionController::startScanning() {
     project_store_.initializeProject(active_scan_dir_, active_project_id_, active_scan_name_);
     current_scan_used_ = true;
 
+    const bool use_lidar = (sensor_toggles_.lidar_mode != SensorSelectionMode::DISABLED_NONE) &&
+                           (sensor_toggles_.primary_geometry != PrimaryGeometrySensorMode::FORCE_DEPTH) &&
+                           (sensor_toggles_.primary_geometry != PrimaryGeometrySensorMode::FORCE_MONOCULAR);
+    const bool use_rgb   = (sensor_toggles_.rgb_mode != SensorSelectionMode::DISABLED_NONE);
+    const bool use_depth = (sensor_toggles_.depth_mode != SensorSelectionMode::DISABLED_NONE) &&
+                           (sensor_toggles_.primary_geometry != PrimaryGeometrySensorMode::FORCE_MONOCULAR);
+    const bool use_inertial_sense = (sensor_toggles_.imu_mode == SensorSelectionMode::AUTO) ||
+                                    (sensor_toggles_.imu_mode == SensorSelectionMode::ENABLED_SPECIFIC &&
+                                     sensor_toggles_.imu_source_id == "inertial_sense_imu") ||
+                                    (sensor_toggles_.gnss_mode != SensorSelectionMode::DISABLED_NONE);
+    const bool use_host_imu = (sensor_toggles_.imu_mode == SensorSelectionMode::AUTO && !use_lidar) ||
+                              (sensor_toggles_.imu_mode == SensorSelectionMode::ENABLED_SPECIFIC &&
+                               sensor_toggles_.imu_source_id != "airy_imu" &&
+                               sensor_toggles_.imu_source_id != "inertial_sense_imu");
+
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
         agnostic_engine_.reset();
@@ -634,9 +664,17 @@ bool DesktopSessionController::startScanning() {
         last_loop_kf_id_ = 0;
         has_prev_odom_pos_ = false;
         universal_seq_id_ = 0;
-        last_lidar_arrival_sec_ = 0.0;
-        if (factory_calib_.valid) {
-            agnostic_engine_.coreEngine().setFactoryCalibration(factory_calib_);
+        // Give LiDAR a 2.5s startup window so Depth/Mono fallback never fires before first UDP sweep!
+        last_lidar_arrival_sec_ = use_lidar ? steadyNowSec() : 0.0;
+        if (use_lidar) {
+            if (factory_calib_.valid) {
+                agnostic_engine_.coreEngine().setFactoryCalibration(factory_calib_);
+            }
+        } else {
+            // CRITICAL: Never apply Airy's 45-deg T_imu_lidar tilt to 336L Depth or Webcam!
+            auto rgbd_rig = sensors::GenericSensorRigConfig::presetAppleArkitDepth();
+            rgbd_rig.T_imu_lidar = math::SE3d::Identity();
+            agnostic_engine_.setSensorRigConfig(rgbd_rig);
         }
         agnostic_engine_.setExtrinsicCalibration(calib_profile_);
         agnostic_engine_.coreEngine().setVisualFusionEnabled(false);
@@ -648,21 +686,6 @@ bool DesktopSessionController::startScanning() {
         standalone_depth_queue_.clear();
         standalone_imu_queue_.clear();
     }
-
-    const bool use_lidar = (sensor_toggles_.lidar_mode != SensorSelectionMode::DISABLED_NONE) &&
-                           (sensor_toggles_.primary_geometry != PrimaryGeometrySensorMode::FORCE_DEPTH) &&
-                           (sensor_toggles_.primary_geometry != PrimaryGeometrySensorMode::FORCE_MONOCULAR);
-    const bool use_rgb   = (sensor_toggles_.rgb_mode != SensorSelectionMode::DISABLED_NONE);
-    const bool use_depth = (sensor_toggles_.depth_mode != SensorSelectionMode::DISABLED_NONE) &&
-                           (sensor_toggles_.primary_geometry != PrimaryGeometrySensorMode::FORCE_MONOCULAR);
-    const bool use_inertial_sense = (sensor_toggles_.imu_mode == SensorSelectionMode::AUTO) ||
-                                    (sensor_toggles_.imu_mode == SensorSelectionMode::ENABLED_SPECIFIC &&
-                                     sensor_toggles_.imu_source_id == "inertial_sense_imu") ||
-                                    (sensor_toggles_.gnss_mode != SensorSelectionMode::DISABLED_NONE);
-    const bool use_host_imu = (sensor_toggles_.imu_mode == SensorSelectionMode::AUTO) ||
-                              (sensor_toggles_.imu_mode == SensorSelectionMode::ENABLED_SPECIFIC &&
-                               sensor_toggles_.imu_source_id != "airy_imu" &&
-                               sensor_toggles_.imu_source_id != "inertial_sense_imu");
 
     if (use_lidar) {
         fs::path raw_path = fs::path(active_scan_dir_) / (active_scan_id_ + "_raw.avraw");
@@ -725,7 +748,7 @@ void DesktopSessionController::slamWorkerLoop() {
                 }
             }
             have_bundle = true;
-        } else if ((steadyNowSec() - last_lidar_arrival_sec_) > 0.25) {
+        } else if ((steadyNowSec() - last_lidar_arrival_sec_) > 2.5) {
             // Sensor-agnostic fallback: run Depth-only (336L) or Monocular-only (Surface webcam / USB cam),
             // automatically attaching Host/PC IMU samples when IMU is enabled!
             std::lock_guard<std::mutex> lk(mono_rgb_mutex_);
@@ -872,7 +895,10 @@ bool DesktopSessionController::saveAndRefineSession() {
             }
         }
         if (!cleaned.empty()) {
-            cached_global_cloud_ = std::move(cleaned);
+            // Preserve sparse monocular/visual clouds if LiDAR-tuned SOR over-pruned them
+            if (cached_global_cloud_.size() >= 25000 || cleaned.size() >= cached_global_cloud_.size() / 2) {
+                cached_global_cloud_ = std::move(cleaned);
+            }
         }
         latest_floor_plan_ = quality::QualityMonitor::generateLiveFloorPlan(
             cached_global_cloud_, pose_graph_.getSubmaps(), pose_graph_.getFactors(), 0.08);

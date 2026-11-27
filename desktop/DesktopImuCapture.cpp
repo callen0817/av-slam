@@ -182,6 +182,9 @@ void DesktopImuCapture::captureLoop(std::string preferred_imu_id) {
                         status_summary_ = "ACTIVE: " + dev_name + " 200Hz IMU";
                     }
 
+                    bool gravity_sign_checked = false;
+                    double z_sign = 1.0;
+
                     while (running_.load()) {
                         auto frameSet = pipe.waitForFrameset(100);
                         if (!frameSet) continue;
@@ -197,11 +200,20 @@ void DesktopImuCapture::captureLoop(std::string preferred_imu_id) {
                         auto gv = gyroFrame->getValue();
 
                         // Convert Orbbec optical IMU frame (+X right, +Y down, +Z fwd)
-                        // -> AV-SLAM FLU body frame (+X fwd, +Y left, +Z up)
+                        // -> AV-SLAM FLU body frame (+X fwd, +Y left, +Z up).
+                        // Auto-verify gravity Z sign on first valid stationary sample so
+                        // upright gravity ALWAYS points +Z (+9.81 m/s^2) and never causes 2g free-fall!
+                        double ax = av.z;
+                        double ay = -av.x;
+                        double az = -av.y;
+                        if (!gravity_sign_checked && std::abs(az) > 4.0) {
+                            z_sign = (az < 0.0) ? -1.0 : 1.0;
+                            gravity_sign_checked = true;
+                        }
                         core::ImuMeasurement meas;
                         meas.timestamp_sec = nowSteadySec();
-                        meas.accel_mps2 = math::Vec3d(av.z, -av.x, -av.y);
-                        meas.gyro_rads  = math::Vec3d(gv.z, -gv.x, -gv.y);
+                        meas.accel_mps2 = math::Vec3d(ax, ay * z_sign, az * z_sign);
+                        meas.gyro_rads  = math::Vec3d(gv.z, -gv.x * z_sign, -gv.y * z_sign);
                         samples_delivered_.fetch_add(1);
 
                         ImuCallback cb;

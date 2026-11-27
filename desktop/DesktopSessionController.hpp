@@ -169,8 +169,10 @@ public:
     double cameraMeasuredFps() const { return camera_.measuredFps(); }
     std::string depthStatusSummary() const { return depth_capture_.statusSummary(); }
     std::string imuStatusSummary() const;
-    std::vector<std::string> availableCameraNames() const { return camera_.enumerateCameraNames(); }
+    // Cached device lists (NEVER re-enumerate COM/MF/OrbbecSDK at 60 FPS inside ImGui!)
+    std::vector<std::string> availableCameraNames() const;
     std::vector<DetectedImuInfo> availableImuSources() const;
+    void refreshCachedSensorLists();
     void selectCameraOverride(const std::string& exact_name);
     std::string selectedCameraOverride() const { return camera_.exactCameraNameOverride(); }
 
@@ -216,6 +218,9 @@ private:
     DesktopInertialSenseCapture inertial_sense_;
     DesktopHardwareManager hw_manager_;
     DesktopSensorToggles sensor_toggles_{};
+    mutable std::mutex device_cache_mutex_;
+    std::vector<std::string> cached_camera_names_;
+    std::vector<DetectedImuInfo> cached_imu_sources_;
 
     sync::TimeSynchronizer synchronizer_;
     slam::SensorAgnosticSlamEngine agnostic_engine_;

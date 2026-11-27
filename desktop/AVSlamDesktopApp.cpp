@@ -185,16 +185,19 @@ int main(int argc, char** argv) {
     int color_mode = 0; // 0=RGB, 1=Reflectivity, 2=Elevation Z
     float point_size = 3.0f;
 
+    bool in_project_lobby = true;
     bool show_projects_modal = false;
     bool show_cslam_window = false;
     bool show_airy_window = false;
     bool show_calib_window = false;
     bool show_export_modal = false;
     bool show_hardware_window = controller.hasPendingHardwareOptimization();
+    bool cslam_guest_mode = false;
+    std::string cslam_join_status;
 
     char new_proj_name[128] = "Site_Project_01";
     char new_proj_site[128] = "Building A";
-    char new_scan_name[128] = "Scan_02";
+    char new_scan_name[128] = "";
     char new_scan_floor[64] = "Level 01";
     char peer_ip_buf[64] = "192.168.1.50";
     char airy_ip_buf[64] = "192.168.1.200";
@@ -325,9 +328,11 @@ int main(int argc, char** argv) {
 
         // Top Navigation Bar
         if (ImGui::BeginMainMenuBar()) {
-            ImGui::TextColored(ImVec4(0.90f, 0.79f, 0.51f, 1.0f), "AV SLAM DESKTOP");
+            ImGui::TextColored(ImVec4(0.90f, 0.79f, 0.51f, 1.0f), "AV SLAM");
             ImGui::Separator();
-            if (ImGui::Button("Projects")) show_projects_modal = !show_projects_modal;
+            if (ImGui::Button(in_project_lobby ? "Scanner View" : "Home / Projects")) {
+                in_project_lobby = !in_project_lobby;
+            }
             char cslam_btn[48];
             if (controller.isCslamEnabled()) {
                 std::snprintf(cslam_btn, sizeof(cslam_btn), "C-SLAM (%zu)", cslam_stats.discovered_peers);
@@ -479,7 +484,96 @@ int main(int argc, char** argv) {
             ImGui::EndMainMenuBar();
         }
 
-        // Top-Left HUD Status & Metrics Card
+        // Stage 1: Project Selection, Scan Naming & Live C-SLAM Join Lobby
+        if (in_project_lobby) {
+            ImGui::SetNextWindowPos(ImVec2(static_cast<float>(fb_w) * 0.5f, static_cast<float>(fb_h) * 0.5f),
+                                    ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+            ImGui::SetNextWindowSize(ImVec2(960, 560), ImGuiCond_Always);
+            ImGui::Begin("AV SLAM — Project & Live C-SLAM Lobby", nullptr,
+                         ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove);
+
+            ImGui::Columns(2, "LobbyCols", true);
+            // Left Column: Local Projects + Scan Setup + Org Cloud Placeholder
+            ImGui::TextColored(ImVec4(0.90f, 0.79f, 0.51f, 1.0f), "1. SELECT OR CREATE PROJECT FOLDER");
+            ImGui::Spacing();
+            ImGui::InputText("New Project", new_proj_name, sizeof(new_proj_name));
+            ImGui::InputText("Site / Building", new_proj_site, sizeof(new_proj_site));
+            if (ImGui::Button("Create Project Folder", ImVec2(200, 28))) {
+                controller.createProject(new_proj_name, new_proj_site, "");
+            }
+            ImGui::Separator();
+            ImGui::Text("Local Projects:");
+            ImGui::BeginChild("LocalProjList", ImVec2(0, 150), true);
+            for (const auto& pr : controller.listProjects()) {
+                bool sel = (pr.id == controller.activeProjectId());
+                if (ImGui::Selectable((pr.name + "  (" + std::to_string(pr.scan_count) + " scans)").c_str(), sel)) {
+                    controller.openProject(pr.id);
+                }
+            }
+            ImGui::EndChild();
+
+            ImGui::Separator();
+            ImGui::TextColored(ImVec4(0.90f, 0.79f, 0.51f, 1.0f), "2. NAME YOUR SCAN");
+            ImGui::TextDisabled("Active Project: %s", controller.activeProjectName().c_str());
+            ImGui::InputText("Scan Name (blank = auto)", new_scan_name, sizeof(new_scan_name));
+            ImGui::InputText("Floor / Level", new_scan_floor, sizeof(new_scan_floor));
+            ImGui::Spacing();
+            if (ImGui::Button("Enter Scanning Screen ->", ImVec2(240, 38))) {
+                if (std::strlen(new_scan_name) > 0) {
+                    controller.createAndSelectScan(new_scan_name, new_scan_floor);
+                    new_scan_name[0] = '\0';
+                }
+                cslam_guest_mode = false;
+                in_project_lobby = false;
+            }
+            ImGui::Spacing();
+            ImGui::TextDisabled("Company / Org Cloud: Local Mode (Org sync & shared previews ready)");
+
+            // Right Column: Live C-SLAM Sessions (Nearby / Joinable)
+            ImGui::NextColumn();
+            ImGui::TextColored(ImVec4(0.29f, 0.87f, 0.50f, 1.0f), "LIVE C-SLAM SESSIONS (JOIN AS GUEST / SLAVE)");
+            ImGui::TextWrapped("Discover active nearby scans on your site/LAN. Joining sends a request to the Host; once approved, clouds build live on all devices and the final scan is owned by the Host.");
+            ImGui::Spacing();
+            bool cslam_en = controller.isCslamEnabled();
+            if (ImGui::Button(cslam_en ? "Listening for Live Scans (ON)" : "Scan for Live C-SLAM Jobs", ImVec2(240, 30))) {
+                controller.setCollaborativeSlamEnabled(!cslam_en);
+            }
+            ImGui::Separator();
+            auto peers = controller.connectedPeers();
+            if (peers.empty()) {
+                ImGui::TextDisabled("No active C-SLAM hosts broadcasting nearby yet.");
+                ImGui::TextDisabled("Or enter a Host IP directly below to request to join:");
+            } else {
+                for (const auto& p : peers) {
+                    ImGui::TextColored(ImVec4(0.29f, 0.87f, 0.50f, 1.0f), "[LIVE] %s (%s)",
+                                       p.display_name.c_str(), p.ip_address.c_str());
+                    ImGui::SameLine();
+                    if (ImGui::Button(("Request Join##" + p.ip_address).c_str())) {
+                        controller.connectCollaborativePeerByIp(p.ip_address);
+                        cslam_guest_mode = true;
+                        cslam_join_status = "Join request sent to Host " + p.ip_address + " (Host-Owned Final Scan)";
+                        in_project_lobby = false;
+                    }
+                }
+            }
+            ImGui::Separator();
+            ImGui::InputText("Host IP", peer_ip_buf, sizeof(peer_ip_buf));
+            if (ImGui::Button("Request to Join Host IP ->", ImVec2(220, 32))) {
+                controller.connectCollaborativePeerByIp(peer_ip_buf);
+                cslam_guest_mode = true;
+                cslam_join_status = "Requested join to Host " + std::string(peer_ip_buf) + " (Host-Owned Final Scan)";
+                in_project_lobby = false;
+            }
+            if (!cslam_join_status.empty()) {
+                ImGui::TextColored(ImVec4(0.22f, 0.74f, 0.97f, 1.0f), "%s", cslam_join_status.c_str());
+            }
+
+            ImGui::Columns(1);
+            ImGui::End();
+        }
+
+        // Top-Left HUD Status & Metrics Card (shown in Scanner View)
+        if (!in_project_lobby) {
         ImGui::SetNextWindowPos(ImVec2(14, 34), ImGuiCond_Always);
         ImGui::SetNextWindowSize(ImVec2(500, 212), ImGuiCond_Always);
         ImGui::Begin("##HudStatus", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove);
@@ -595,6 +689,7 @@ int main(int argc, char** argv) {
             ImGui::TextColored(ImVec4(0.29f, 0.87f, 0.50f, 1.0f), "%s", export_status.c_str());
         }
         ImGui::End();
+        }  // end if (!in_project_lobby)
 
         // Projects & Scan Manager Window
         if (show_projects_modal) {

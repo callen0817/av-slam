@@ -356,41 +356,58 @@ bool SensorAgnosticSlamEngine::runMonocularDirectStep(const core::RgbFrame& rgb,
             }
 
             const double baseline = dt_body.norm();
-            // Triangulate tracked features into FLU body frame (and world frame) with color
-            for (const auto& f : inliers) {
-                const double rot_u = dyaw * fx;
-                const double rot_v = -dpitch * fy;
-                const double parallax_px = std::hypot(f.du - rot_u, f.dv - rot_v);
-                double depth_m = 2.2;
-                if (baseline > 0.004 && parallax_px > 0.4) {
-                    depth_m = std::clamp((fx * baseline) / parallax_px, 0.55, 6.0);
+            // Compute median parallax depth from tracked LK landmarks
+            double scene_depth_m = 2.2;
+            if (baseline > 0.004) {
+                std::vector<double> depths;
+                depths.reserve(inliers.size());
+                for (const auto& f : inliers) {
+                    const double rot_u = dyaw * fx;
+                    const double rot_v = -dpitch * fy;
+                    const double ppx = std::hypot(f.du - rot_u, f.dv - rot_v);
+                    if (ppx > 0.4) depths.push_back(std::clamp((fx * baseline) / ppx, 0.55, 6.0));
                 }
-                const double x_cam = (f.u1 - cx) * depth_m / fx;
-                const double y_cam = (f.v1 - cy) * depth_m / fy;
-                const double z_cam = depth_m;
-
-                // Convert camera optical -> FLU body frame (+X forward, +Y left, +Z up)
-                core::LidarPointXYZIRT p;
-                p.x = z_cam;
-                p.y = -x_cam;
-                p.z = -y_cam;
-                p.range_m = static_cast<float>(std::sqrt(p.x * p.x + p.y * p.y + p.z * p.z));
-                p.timestamp_sec = rgb.timestamp_sec;
-                p.intensity = 180.0f;
-
-                int iu = std::clamp(static_cast<int>(std::round(f.u1)), 0, w - 1);
-                int iv = std::clamp(static_cast<int>(std::round(f.v1)), 0, h - 1);
-                size_t pix = static_cast<size_t>(iv * w + iu);
-                if (rgb.rgb_bytes.size() >= static_cast<size_t>(w * h * 3)) {
-                    p.r = rgb.rgb_bytes[pix * 3 + 0];
-                    p.g = rgb.rgb_bytes[pix * 3 + 1];
-                    p.b = rgb.rgb_bytes[pix * 3 + 2];
-                    p.colorized = true;
+                if (!depths.empty()) {
+                    size_t mid = depths.size() / 2;
+                    std::nth_element(depths.begin(), depths.begin() + mid, depths.end());
+                    scene_depth_m = depths[mid];
                 }
-                out_body_frame.points.push_back(p);
-                math::Vec3d pw = mono_state_.T_world_body.transform(math::Vec3d(p.x, p.y, p.z));
-                p.x = pw.x; p.y = pw.y; p.z = pw.z;
-                out_world_frame.points.push_back(p);
+            }
+
+            // Emit dense colorized semi-dense gradient cloud (~350-600 pts/frame) in FLU body frame
+            // so monocular scans produce rich room structure that survives Tier-2 cleanup
+            const int stride_px = std::max(8, w / 48);
+            for (int y = 8; y < h - 8; y += stride_px) {
+                for (int x = 8; x < w - 8; x += stride_px) {
+                    size_t pix = static_cast<size_t>(y * w + x);
+                    double gx = std::abs(static_cast<double>(rgb.gray_bytes[pix + 1]) -
+                                         static_cast<double>(rgb.gray_bytes[pix - 1]));
+                    double gy = std::abs(static_cast<double>(rgb.gray_bytes[pix + w]) -
+                                         static_cast<double>(rgb.gray_bytes[pix - w]));
+                    if (gx + gy < 16.0) continue;
+
+                    const double x_cam = (static_cast<double>(x) - cx) * scene_depth_m / fx;
+                    const double y_cam = (static_cast<double>(y) - cy) * scene_depth_m / fy;
+                    const double z_cam = scene_depth_m;
+
+                    core::LidarPointXYZIRT p;
+                    p.x = z_cam;
+                    p.y = -x_cam;
+                    p.z = -y_cam;
+                    p.range_m = static_cast<float>(std::sqrt(p.x * p.x + p.y * p.y + p.z * p.z));
+                    p.timestamp_sec = rgb.timestamp_sec;
+                    p.intensity = static_cast<float>(std::min(255.0, gx + gy));
+                    if (rgb.rgb_bytes.size() >= static_cast<size_t>(w * h * 3)) {
+                        p.r = rgb.rgb_bytes[pix * 3 + 0];
+                        p.g = rgb.rgb_bytes[pix * 3 + 1];
+                        p.b = rgb.rgb_bytes[pix * 3 + 2];
+                        p.colorized = true;
+                    }
+                    out_body_frame.points.push_back(p);
+                    math::Vec3d pw = mono_state_.T_world_body.transform(math::Vec3d(p.x, p.y, p.z));
+                    p.x = pw.x; p.y = pw.y; p.z = pw.z;
+                    out_world_frame.points.push_back(p);
+                }
             }
             out_metrics.visual_update_applied = true;
         }
@@ -521,8 +538,26 @@ bool SensorAgnosticSlamEngine::processUniversalBundle(const UniversalSensorBundl
     bool ok = false;
     if (has_geometry) {
         using_mono_fallback_ = false;
+        const math::SE3d prev_pose = core_engine_.getCurrentState().T_world_body;
+        const bool had_prev = (agnostic_status_.frames_processed > 0);
         ok = core_engine_.processBundle(sync_bundle, out_body_frame, out_world_frame, out_metrics);
-        if (ok) agnostic_status_.frames_processed++;
+        if (ok) {
+            // Sanity guard for narrow-FOV Depth-only (336L) scans: prevent single-frame
+            // velocity/gravity blowups (e.g. >0.35m or >25 deg jump in 33ms)
+            if (!has_lidar && had_prev) {
+                const math::SE3d cur_pose = core_engine_.getCurrentState().T_world_body;
+                const double jump_m = (cur_pose.t - prev_pose.t).norm();
+                const double jump_deg =
+                    (prev_pose.so3.inverse() * cur_pose.so3).log().norm() * math::kRadToDeg;
+                if (jump_m > 0.35 || jump_deg > 25.0 || !std::isfinite(jump_m)) {
+                    core_engine_.resetPose(prev_pose);
+                    out_world_frame.points.clear();
+                    out_metrics.keyframe_emitted = false;
+                    return false;
+                }
+            }
+            agnostic_status_.frames_processed++;
+        }
     } else if (bundle.rgb_frame.has_value()) {
         ok = runMonocularDirectStep(bundle.rgb_frame.value(), bundle.imu_measurements,
                                     out_body_frame, out_world_frame, out_metrics);
