@@ -200,6 +200,7 @@ if(AVSLAM_BUILD_DESKTOP_APP AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
         desktop/AVSlamDesktopApp.cpp
         desktop/DesktopSessionController.cpp
         desktop/DesktopCameraCapture.cpp
+        desktop/DesktopDepthCapture.cpp
         ${imgui_SOURCE_DIR}/imgui.cpp
         ${imgui_SOURCE_DIR}/imgui_draw.cpp
         ${imgui_SOURCE_DIR}/imgui_tables.cpp

@@ -336,6 +336,21 @@ int main(int argc, char** argv) {
                 ImGui::EndMenu();
             }
 
+            if (ImGui::BeginMenu("Camera")) {
+                std::string cur_cam = controller.selectedCameraOverride();
+                if (ImGui::MenuItem("Auto-Select (Prefer Orbbec 336L RGB)", nullptr, cur_cam.empty())) {
+                    controller.selectCameraOverride("");
+                }
+                ImGui::Separator();
+                for (const auto& cname : controller.availableCameraNames()) {
+                    bool sel = (cname == cur_cam);
+                    if (ImGui::MenuItem(cname.c_str(), nullptr, sel)) {
+                        controller.selectCameraOverride(cname);
+                    }
+                }
+                ImGui::EndMenu();
+            }
+
             if (ImGui::BeginMenu("Rig Profile")) {
                 const auto& profiles = avscan::core::DeviceProfileRegistry::instance().allProfiles();
                 std::string cur_id = controller.activeDeviceProfileId();
@@ -377,6 +392,7 @@ int main(int argc, char** argv) {
                     cloud.size(), controller.loopClosureCount(),
                     pkt.msopPacketLossRatio() * 100.0, slam_stats.avg_frame_ms);
         ImGui::Text("CAM: %s (%.1f FPS)", controller.cameraStatusSummary().c_str(), controller.cameraMeasuredFps());
+        ImGui::Text("DEPTH: %s", controller.depthStatusSummary().c_str());
         ImGui::TextColored(ImVec4(0.29f, 0.87f, 0.50f, 1.0f), "QUALITY: %.0f%%  |  RMSE: %.3f m  |  DRIFT RISK: %.2f m",
                            qual.overall_quality_score * 100.0, qual.registration_rmse_m, qual.estimated_drift_risk_m);
         ImGui::End();

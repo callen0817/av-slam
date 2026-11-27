@@ -60,6 +60,16 @@ void DesktopCameraCapture::setPreferredCameraHint(const std::string& name_hint,
     fallback_intrinsics_ = fallback_intrinsics;
 }
 
+void DesktopCameraCapture::setExactCameraNameOverride(const std::string& exact_name) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    exact_camera_override_ = exact_name;
+}
+
+std::string DesktopCameraCapture::exactCameraNameOverride() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return exact_camera_override_;
+}
+
 void DesktopCameraCapture::setFrameCallback(FrameCallback cb) {
     std::lock_guard<std::mutex> lock(mutex_);
     on_frame_ = std::move(cb);
@@ -153,10 +163,12 @@ void DesktopCameraCapture::captureLoop() {
     IMFSourceReader* reader = nullptr;
 
     std::string hint;
+    std::string exact_override;
     core::CameraIntrinsics fallback_intr;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         hint = toLowerCopy(preferred_hint_);
+        exact_override = exact_camera_override_;
         fallback_intr = fallback_intrinsics_;
     }
 
@@ -165,6 +177,9 @@ void DesktopCameraCapture::captureLoop() {
         if (SUCCEEDED(MFEnumDeviceSources(attrs, &devices, &count)) && count > 0) {
             // Score every enumerated UVC camera so Orbbec Gemini 336L RGB / Color always beats Depth/IR/Front
             auto scoreCameraName = [&](const std::string& rawName) -> int {
+                if (!exact_override.empty() && rawName == exact_override) {
+                    return 100000;
+                }
                 std::string nl = toLowerCopy(rawName);
                 int score = 0;
                 // Strictly penalize Depth / IR / Infrared endpoints (Orbbec exposes separate Depth/IR/RGB UVC devices)

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "DesktopCameraCapture.hpp"
+#include "DesktopDepthCapture.hpp"
 #include "avscan/backend/GicpVerifier.hpp"
 #include "avscan/backend/PoseGraphOptimizer.hpp"
 #include "avscan/backend/ScanContext.hpp"
@@ -138,6 +139,10 @@ public:
     size_t loopClosureCount() const { return pose_graph_.numLoopClosures(); }
     std::string cameraStatusSummary() const { return camera_.statusSummary(); }
     double cameraMeasuredFps() const { return camera_.measuredFps(); }
+    std::string depthStatusSummary() const { return depth_capture_.statusSummary(); }
+    std::vector<std::string> availableCameraNames() const { return camera_.enumerateCameraNames(); }
+    void selectCameraOverride(const std::string& exact_name) { camera_.setExactCameraNameOverride(exact_name); }
+    std::string selectedCameraOverride() const { return camera_.exactCameraNameOverride(); }
 
 private:
     static double steadyNowSec();
@@ -150,6 +155,7 @@ private:
     std::unique_ptr<sensors::AiryDiscovery> discovery_;
     std::unique_ptr<sensors::AiryUdpReceiver> udp_receiver_;
     DesktopCameraCapture camera_;
+    DesktopDepthCapture depth_capture_;
 
     sync::TimeSynchronizer synchronizer_;
     slam::SensorAgnosticSlamEngine agnostic_engine_;
@@ -186,6 +192,7 @@ private:
 
     std::mutex mono_rgb_mutex_;
     std::deque<core::RgbFrame> standalone_rgb_queue_;
+    std::deque<sensors::DepthFrame> standalone_depth_queue_;
     std::optional<sensors::GnssRtkMeasurement> pending_gnss_fix_;
     double last_lidar_arrival_sec_{0.0};
     uint64_t universal_seq_id_{0};

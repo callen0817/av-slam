@@ -22,6 +22,8 @@ public:
 
     void setPreferredCameraHint(const std::string& name_hint,
                                 const core::CameraIntrinsics& fallback_intrinsics);
+    void setExactCameraNameOverride(const std::string& exact_name); // Empty = auto-score
+    std::string exactCameraNameOverride() const;
     void setFrameCallback(FrameCallback cb);
 
     std::vector<std::string> enumerateCameraNames() const;
@@ -45,6 +47,7 @@ private:
 
     mutable std::mutex mutex_;
     std::string preferred_hint_{"Gemini"};
+    std::string exact_camera_override_;
     core::CameraIntrinsics fallback_intrinsics_{};
     std::string active_camera_name_{"None"};
     std::string status_summary_{"IDLE"};

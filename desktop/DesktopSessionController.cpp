@@ -201,6 +201,14 @@ void DesktopSessionController::setupCallbacks() {
             while (standalone_rgb_queue_.size() > 4) standalone_rgb_queue_.pop_front();
         }
     });
+
+    depth_capture_.setDepthCallback([this](const sensors::DepthFrame& df) {
+        if (!is_terrestrial_active_.load()) {
+            std::lock_guard<std::mutex> lk(mono_rgb_mutex_);
+            standalone_depth_queue_.push_back(df);
+            while (standalone_depth_queue_.size() > 4) standalone_depth_queue_.pop_front();
+        }
+    });
 }
 
 std::string DesktopSessionController::projectsRootDir() const {
@@ -396,12 +404,17 @@ bool DesktopSessionController::startScanning() {
     {
         std::lock_guard<std::mutex> lk(mono_rgb_mutex_);
         standalone_rgb_queue_.clear();
+        standalone_depth_queue_.clear();
     }
 
     fs::path raw_path = fs::path(active_scan_dir_) / "raw_capture.avraw";
     udp_receiver_->startRawRecording(raw_path.string());
     udp_receiver_->start();
     camera_.start(30);
+    if (active_universal_profile_id_ != "monocular_camera_standalone" &&
+        active_universal_profile_id_ != "airy_standalone") {
+        depth_capture_.start();
+    }
 
     is_scanning_.store(true);
     worker_running_.store(true);
@@ -415,6 +428,7 @@ void DesktopSessionController::stopScanning() {
         if (slam_thread_.joinable()) slam_thread_.join();
     }
     camera_.stop();
+    depth_capture_.stop();
     udp_receiver_->stopRawRecording();
 }
 
@@ -434,11 +448,28 @@ void DesktopSessionController::slamWorkerLoop() {
             u_bundle.lidar_frame = bundle.lidar_frame;
             u_bundle.imu_measurements = bundle.imu_measurements;
             u_bundle.rgb_frame = bundle.rgb_frame;
+            {
+                std::lock_guard<std::mutex> lk(mono_rgb_mutex_);
+                if (!standalone_depth_queue_.empty()) {
+                    u_bundle.depth_frame = standalone_depth_queue_.back();
+                    standalone_depth_queue_.clear();
+                }
+            }
             have_bundle = true;
         } else if ((steadyNowSec() - last_lidar_arrival_sec_) > 0.25) {
-            // Sensor-agnostic fallback: run Monocular-only (or Depth-only) when no LiDAR is attached!
+            // Sensor-agnostic fallback: run Depth-only (336L) or Monocular-only (Surface webcam / USB cam)!
             std::lock_guard<std::mutex> lk(mono_rgb_mutex_);
-            if (!standalone_rgb_queue_.empty()) {
+            if (!standalone_depth_queue_.empty()) {
+                u_bundle.sequence_id = ++universal_seq_id_;
+                u_bundle.depth_frame = standalone_depth_queue_.front();
+                u_bundle.timestamp_sec = u_bundle.depth_frame->timestamp_sec;
+                standalone_depth_queue_.pop_front();
+                if (!standalone_rgb_queue_.empty()) {
+                    u_bundle.rgb_frame = standalone_rgb_queue_.back();
+                    standalone_rgb_queue_.clear();
+                }
+                have_bundle = true;
+            } else if (!standalone_rgb_queue_.empty()) {
                 u_bundle.sequence_id = ++universal_seq_id_;
                 u_bundle.rgb_frame = standalone_rgb_queue_.front();
                 u_bundle.timestamp_sec = u_bundle.rgb_frame->timestamp_sec;
