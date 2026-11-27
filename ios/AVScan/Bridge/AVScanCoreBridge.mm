@@ -870,14 +870,16 @@ void rebuildLiveVoxelIndex(
                                 const avscan::math::SE3d delta = initGuess.inverse() * ver.T_target_source;
                                 const double deltaRotDeg = delta.so3.log().norm() * (180.0 / 3.14159265358979323846);
                                 const double deltaTransM = delta.t.norm();
-                                if (deltaRotDeg < 20.0 && deltaTransM < 2.0) {
+                                const double deltaZM = std::abs(ver.T_target_source.t.z - initGuess.t.z);
+                                if (deltaRotDeg < 15.0 && deltaTransM < 1.5 && deltaZM < 0.60 &&
+                                    ver.fitness_rmse_m <= 0.06 && ver.inlier_overlap_ratio >= 0.55) {
                                     _poseGraph.addVerifiedLoopFactor(
                                         targetSm.keyframe_id,
                                         submap.keyframe_id,
                                         ver.T_target_source,
                                         ver.information_diagonal,
                                         true);
-                                    _poseGraph.optimizeGlobalPoseGraph(15);
+                                    _poseGraph.optimizeGlobalPoseGraph(8);
                                     _lastLoopKeyframeId = submap.keyframe_id;
                                     _unclosedTrajectoryDistM = 0.0;
                                     // Decouple frontend LIO from backend PGO (never teleport frontend away from local_map_)
