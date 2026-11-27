@@ -1275,6 +1275,11 @@ void rebuildLiveVoxelIndex(
                     pose = strongSelf->_slamEngine.getCurrentState().T_world_body;
                     kfCount = static_cast<uint32_t>(strongSelf->_poseGraph.getSubmaps().size());
                 }
+                NSString *devName = [[UIDevice currentDevice] name] ?: @"iPad";
+                NSString *pName = strongSelf->_activeProjectName ?: @"Project";
+                NSString *sName = strongSelf->_activeScanName ?: @"Scan";
+                NSString *fullLabel = [NSString stringWithFormat:@"%@ | %@ / %@", devName, pName, sName];
+                strongSelf->_cslamEngine->setLocalIdentity("", fullLabel.UTF8String);
                 auto beacon = strongSelf->_cslamEngine->serializeBeacon(pose, kfCount);
                 if (strongSelf->_cslamLanTransport && strongSelf->_cslamLanTransport->isRunning()) {
                     strongSelf->_cslamLanTransport->broadcastUdpPacket(beacon);
@@ -1317,15 +1322,21 @@ void rebuildLiveVoxelIndex(
 
 - (void)syncSharedOriginWithPeers {
     if (!_cslamEngine) return;
-    _cslamEngine->syncSharedOriginWithAllPeers();
-    auto pkt = _cslamEngine->serializeSharedOriginSync();
-    if (_cslamLanTransport && _cslamLanTransport->isRunning()) {
-        _cslamLanTransport->broadcastUdpPacket(pkt);
-        _cslamLanTransport->broadcastTcpPacket(pkt);
-    }
-    if (_multipeerTransport && _multipeerTransport.isRunning) {
-        [_multipeerTransport broadcastData:pkt reliable:YES];
-    }
+    // Run GICP cloud snapping & TCP broadcast off the main UI thread so iOS NEVER freezes!
+    AVScanCoreBridge * __weak weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        AVScanCoreBridge *strongSelf = weakSelf;
+        if (!strongSelf || !strongSelf->_cslamEngine) return;
+        strongSelf->_cslamEngine->syncSharedOriginWithAllPeers();
+        auto pkt = strongSelf->_cslamEngine->serializeSharedOriginSync();
+        if (strongSelf->_cslamLanTransport && strongSelf->_cslamLanTransport->isRunning()) {
+            strongSelf->_cslamLanTransport->broadcastUdpPacket(pkt);
+            strongSelf->_cslamLanTransport->broadcastTcpPacket(pkt);
+        }
+        if (strongSelf->_multipeerTransport && strongSelf->_multipeerTransport.isRunning) {
+            [strongSelf->_multipeerTransport broadcastData:pkt reliable:YES];
+        }
+    });
 }
 
 - (NSArray<NSDictionary<NSString *, id> *> *)connectedCollaborativePeers {

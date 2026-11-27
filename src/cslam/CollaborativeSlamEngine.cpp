@@ -125,10 +125,20 @@ void CollaborativeSlamEngine::addLocalKeyframe(const core::KeyframeSubmap& subma
     std::lock_guard<std::mutex> lock(mutex_);
     local_submaps_.push_back(submap);
     local_descriptors_.push_back(descriptor);
-    // Cap in-RAM local copies used for inter-agent GICP to 250 recent keyframes
     if (local_submaps_.size() > 250) {
         local_submaps_.erase(local_submaps_.begin());
         local_descriptors_.erase(local_descriptors_.begin());
+    }
+    // Automatically try geometric GICP snapping against any peer that is unaligned
+    // or only provisionally Identity-aligned (alignment_rmse_m == 0.0)
+    for (auto& kv : peers_) {
+        auto& peer = kv.second;
+        if (!peer.aligned || peer.alignment_rmse_m <= 1e-6) {
+            auto kfit = peer_keyframes_.find(peer.agent_id);
+            if (kfit != peer_keyframes_.end() && !kfit->second.empty()) {
+                tryAlignPeerWithLocalMap(peer, kfit->second.back());
+            }
+        }
     }
 }
 
@@ -253,7 +263,7 @@ bool CollaborativeSlamEngine::tryAlignPeerWithLocalMap(PeerInfo& peer, const Rem
         return false;
     }
 
-    double best_dist = 0.28;
+    double best_dist = 0.55;
     int best_idx = -1;
     int best_shift = 0;
 
@@ -268,25 +278,46 @@ bool CollaborativeSlamEngine::tryAlignPeerWithLocalMap(PeerInfo& peer, const Rem
         }
     }
 
-    if (best_idx < 0) return false;
-
-    const auto& local_sm = local_submaps_[static_cast<size_t>(best_idx)];
+    const size_t target_idx = (best_idx >= 0) ? static_cast<size_t>(best_idx) : (local_submaps_.size() - 1);
+    const auto& local_sm = local_submaps_[target_idx];
     if (local_sm.local_points.empty()) return false;
 
-    double yaw_rad = static_cast<double>(best_shift) *
-                     (2.0 * 3.14159265358979323846 / static_cast<double>(backend::ScanContextDescriptor::kNumSectors));
-    math::SE3d init_guess(math::SO3d::exp(math::Vec3d(0.0, 0.0, yaw_rad)), math::Vec3d(0.0, 0.0, 0.0));
+    // Build candidate yaw hypotheses: ScanContext yaw first, then 12-way 360-deg coarse search
+    // so two devices starting in the same room at different headings snap together accurately!
+    std::vector<double> yaw_candidates;
+    if (best_idx >= 0) {
+        double sc_yaw = static_cast<double>(best_shift) *
+                        (2.0 * 3.14159265358979323846 / static_cast<double>(backend::ScanContextDescriptor::kNumSectors));
+        yaw_candidates.push_back(sc_yaw);
+    }
+    for (int k = 0; k < 12; ++k) {
+        yaw_candidates.push_back(static_cast<double>(k) * (3.14159265358979323846 / 6.0));
+    }
 
-    auto ver = gicp_verifier_.verifyLoopConstraint(
-        remote_kf.local_points, local_sm.local_points, init_guess);
-    if (!ver.verified) {
+    backend::GicpVerificationResult best_ver{};
+    double best_score = 1e9;
+    for (double yaw_rad : yaw_candidates) {
+        math::SE3d init_guess(math::SO3d::exp(math::Vec3d(0.0, 0.0, yaw_rad)), math::Vec3d(0.0, 0.0, 0.0));
+        auto ver = gicp_verifier_.verifyLoopConstraint(
+            remote_kf.local_points, local_sm.local_points, init_guess);
+        if (ver.verified && ver.fitness_rmse_m <= 0.14 && ver.inlier_overlap_ratio >= 0.30) {
+            double score = ver.fitness_rmse_m / std::max(0.1, ver.inlier_overlap_ratio);
+            if (score < best_score) {
+                best_score = score;
+                best_ver = ver;
+                if (ver.fitness_rmse_m <= 0.05 && ver.inlier_overlap_ratio >= 0.55) break;
+            }
+        }
+    }
+
+    if (!best_ver.verified) {
         return false;
     }
 
     // T_localWorld_peerWorld = T_localWorld_localKf * T_localKf_remoteKf * (T_peerWorld_remoteKf)^-1
-    peer.T_local_peer = local_sm.T_world_keyframe * ver.T_target_source * remote_kf.T_peer_keyframe.inverse();
+    peer.T_local_peer = local_sm.T_world_keyframe * best_ver.T_target_source * remote_kf.T_peer_keyframe.inverse();
     peer.aligned = true;
-    peer.alignment_rmse_m = ver.fitness_rmse_m;
+    peer.alignment_rmse_m = std::max(1e-4, best_ver.fitness_rmse_m);
     stats_.inter_agent_matches++;
     return true;
 }
@@ -459,7 +490,7 @@ bool CollaborativeSlamEngine::ingestRemotePacket(const uint8_t* data,
             }
             peer.keyframe_count = static_cast<uint32_t>(kf_list.size());
             stats_.remote_keyframes_received++;
-            if (!peer.aligned) {
+            if (!peer.aligned || peer.alignment_rmse_m <= 1e-6) {
                 tryAlignPeerWithLocalMap(peer, kf_list.back());
             }
         }
@@ -473,9 +504,18 @@ bool CollaborativeSlamEngine::ingestRemotePacket(const uint8_t* data,
 void CollaborativeSlamEngine::syncSharedOriginWithAllPeers() {
     std::lock_guard<std::mutex> lock(mutex_);
     for (auto& kv : peers_) {
-        kv.second.T_local_peer = math::SE3d::Identity();
-        kv.second.aligned = true;
-        kv.second.alignment_rmse_m = 0.0;
+        auto& peer = kv.second;
+        bool snapped = false;
+        auto kfit = peer_keyframes_.find(peer.agent_id);
+        if (kfit != peer_keyframes_.end() && !kfit->second.empty()) {
+            snapped = tryAlignPeerWithLocalMap(peer, kfit->second.back());
+        }
+        if (!snapped) {
+            // Provisional shared-origin until overlapping geometry arrives for GICP snap
+            peer.T_local_peer = math::SE3d::Identity();
+            peer.aligned = true;
+            peer.alignment_rmse_m = 0.0;
+        }
     }
 }
 

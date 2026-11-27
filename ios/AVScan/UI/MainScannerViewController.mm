@@ -81,6 +81,20 @@
     self.navigationController.navigationBar.tintColor = [AppleGlassTheme goldBright];
 }
 
+- (void)viewDidAppear:(BOOL)animated {
+    [super viewDidAppear:animated];
+    static BOOL didShowInitialLobby = NO;
+    if (!didShowInitialLobby) {
+        didShowInitialLobby = YES;
+        // Enable passive C-SLAM discovery on launch so live nearby scans appear immediately in the Project Lobby
+        [_bridge setCollaborativeSlamEnabled:YES];
+        [self updateCslamButtonTitle];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.9 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            [self openProjectScanMenu];
+        });
+    }
+}
+
 - (void)setupGestures {
     UIPanGestureRecognizer *orbitGesture = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePanGesture:)];
     orbitGesture.maximumNumberOfTouches = 2;

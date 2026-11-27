@@ -9,6 +9,7 @@ using SockLenT = int;
 #define INVALID_SOCK_VAL INVALID_SOCKET
 #else
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/select.h>
 #include <sys/socket.h>
@@ -254,16 +255,42 @@ void CollaborativeLanTransport::sendTcpToIp(const std::string& ip, uint16_t port
         return;
     }
 
-    // Short send/recv timeout so unreachable peers never stall SLAM worker
+    // Non-blocking connect with strict 350 ms timeout so dead/unreachable IPs NEVER freeze UI or SLAM!
 #ifdef _WIN32
-    DWORD timeout_ms = 500;
-    ::setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
+    u_long non_blocking = 1;
+    ioctlsocket(s, FIONBIO, &non_blocking);
 #else
-    timeval tv{0, 500000};
-    ::setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
+    int flags = ::fcntl(s, F_GETFL, 0);
+    if (flags >= 0) ::fcntl(s, F_SETFL, flags | O_NONBLOCK);
 #endif
 
-    if (::connect(s, reinterpret_cast<sockaddr*>(&dst), sizeof(dst)) == 0) {
+    int rc = ::connect(s, reinterpret_cast<sockaddr*>(&dst), sizeof(dst));
+    bool connected = (rc == 0);
+    if (!connected) {
+        fd_set wfds;
+        FD_ZERO(&wfds);
+        FD_SET(s, &wfds);
+        timeval ctv{0, 350000};  // 350 ms max connect wait
+        if (::select(static_cast<int>(s + 1), nullptr, &wfds, nullptr, &ctv) > 0) {
+            int so_err = 0;
+            SockLenT err_len = sizeof(so_err);
+            if (::getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&so_err), &err_len) == 0 && so_err == 0) {
+                connected = true;
+            }
+        }
+    }
+
+    if (connected) {
+#ifdef _WIN32
+        u_long blocking = 0;
+        ioctlsocket(s, FIONBIO, &blocking);
+        DWORD timeout_ms = 400;
+        ::setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout_ms), sizeof(timeout_ms));
+#else
+        if (flags >= 0) ::fcntl(s, F_SETFL, flags);
+        timeval tv{0, 400000};
+        ::setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
+#endif
         uint32_t net_len = htonl(static_cast<uint32_t>(payload.size()));
         ::send(s, reinterpret_cast<const char*>(&net_len), sizeof(net_len), 0);
         ::send(s, reinterpret_cast<const char*>(payload.data()), static_cast<int>(payload.size()), 0);

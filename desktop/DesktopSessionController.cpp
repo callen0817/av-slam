@@ -1047,14 +1047,18 @@ bool DesktopSessionController::setCollaborativeSlamEnabled(bool enabled) {
 }
 
 void DesktopSessionController::cslamBeaconLoop() {
+    const std::string plat_name = cslam::CollaborativeSlamEngine::platformToString(detectDesktopPlatform());
     while (cslam_beacon_running_.load()) {
         math::SE3d pose;
         uint32_t kfs = 0;
+        std::string label;
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
             pose = agnostic_engine_.getCurrentState().T_world_body;
             kfs = static_cast<uint32_t>(pose_graph_.getSubmaps().size());
+            label = "AV-SLAM " + plat_name + " | " + active_project_name_ + " / " + active_scan_name_;
         }
+        cslam_engine_->setLocalIdentity("", label);
         auto beacon = cslam_engine_->serializeBeacon(pose, kfs);
         if (cslam_transport_ && cslam_transport_->isRunning()) {
             cslam_transport_->broadcastUdpPacket(beacon);
@@ -1071,12 +1075,16 @@ void DesktopSessionController::connectCollaborativePeerByIp(const std::string& i
 
 void DesktopSessionController::syncSharedOriginWithPeers() {
     if (!cslam_engine_) return;
-    cslam_engine_->syncSharedOriginWithAllPeers();
-    auto pkt = cslam_engine_->serializeSharedOriginSync();
-    if (cslam_transport_ && cslam_transport_->isRunning()) {
-        cslam_transport_->broadcastUdpPacket(pkt);
-        cslam_transport_->broadcastTcpPacket(pkt);
-    }
+    // Run GICP snap & TCP broadcast asynchronously so clicking Sync NEVER freezes the UI!
+    std::thread([this]() {
+        if (!cslam_engine_) return;
+        cslam_engine_->syncSharedOriginWithAllPeers();
+        auto pkt = cslam_engine_->serializeSharedOriginSync();
+        if (cslam_transport_ && cslam_transport_->isRunning()) {
+            cslam_transport_->broadcastUdpPacket(pkt);
+            cslam_transport_->broadcastTcpPacket(pkt);
+        }
+    }).detach();
 }
 
 std::vector<cslam::PeerInfo> DesktopSessionController::connectedPeers() const {
