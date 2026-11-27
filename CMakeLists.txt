@@ -223,6 +223,23 @@ if(AVSLAM_BUILD_DESKTOP_APP AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
         OpenGL::GL
     )
 
+    # Auto-detect OrbbecSDK v2 (Apache-2.0) for native 200Hz Gemini 336L IMU on Windows & Linux/Jetson
+    set(AVSLAM_ORBBEC_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/build/_deps/orbbec_sdk" CACHE PATH "Path to OrbbecSDK v2")
+    if(EXISTS "${AVSLAM_ORBBEC_SDK_DIR}/include/libobsensor/ObSensor.hpp")
+        message(STATUS "AV-SLAM: Enabling native OrbbecSDK v2 IMU support from ${AVSLAM_ORBBEC_SDK_DIR}")
+        target_compile_definitions(AVSlamDesktop PRIVATE AVSLAM_HAS_ORBBEC_SDK=1)
+        target_include_directories(AVSlamDesktop PRIVATE "${AVSLAM_ORBBEC_SDK_DIR}/include")
+        if(WIN32 AND EXISTS "${AVSLAM_ORBBEC_SDK_DIR}/lib/OrbbecSDK.lib")
+            target_link_libraries(AVSlamDesktop PRIVATE "${AVSLAM_ORBBEC_SDK_DIR}/lib/OrbbecSDK.lib")
+        elseif(UNIX AND NOT APPLE)
+            find_library(ORBBEC_SDK_LIB NAMES OrbbecSDK PATHS "${AVSLAM_ORBBEC_SDK_DIR}/lib" NO_DEFAULT_PATH)
+            if(ORBBEC_SDK_LIB)
+                target_link_libraries(AVSlamDesktop PRIVATE ${ORBBEC_SDK_LIB})
+                set_target_properties(AVSlamDesktop PROPERTIES BUILD_RPATH "${AVSLAM_ORBBEC_SDK_DIR}/lib")
+            endif()
+        endif()
+    endif()
+
     if(WIN32)
         target_link_libraries(AVSlamDesktop PRIVATE mf mfplat mfreadwrite mfuuid ole32 sensorsapi portabledeviceguids)
     elseif(UNIX AND NOT APPLE)

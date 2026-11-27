@@ -4,6 +4,10 @@
 #include <fstream>
 #include <sstream>
 
+#ifdef AVSLAM_HAS_ORBBEC_SDK
+#include <libobsensor/ObSensor.hpp>
+#endif
+
 #ifdef _WIN32
 #include <windows.h>
 #include <sensorsapi.h>
@@ -66,6 +70,29 @@ std::string DesktopImuCapture::statusSummary() const {
 
 std::vector<DetectedImuInfo> DesktopImuCapture::enumerateAvailableImus() const {
     std::vector<DetectedImuInfo> list;
+
+#ifdef AVSLAM_HAS_ORBBEC_SDK
+    try {
+        ob::Context::setLoggerSeverity(OB_LOG_SEVERITY_OFF);
+        ob::Context ctx;
+        auto devList = ctx.queryDeviceList();
+        if (devList && devList->getCount() > 0) {
+            for (uint32_t i = 0; i < devList->getCount(); ++i) {
+                std::string name = devList->getName(i) ? devList->getName(i) : "Orbbec Camera";
+                DetectedImuInfo info;
+                info.id = "orbbec_336l_imu";
+                info.display_name = name + " 200Hz IMU (USB)";
+                info.priority = 85;
+                info.streaming_supported = true;
+                list.push_back(info);
+                break;
+            }
+        }
+    } catch (...) {
+        // Orbbec device not connected or busy
+    }
+#endif
+
 #ifdef _WIN32
     HRESULT hrCom = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     ISensorManager* mgr = nullptr;
@@ -129,7 +156,72 @@ void DesktopImuCapture::stop() {
 }
 
 void DesktopImuCapture::captureLoop(std::string preferred_imu_id) {
-    (void)preferred_imu_id;
+#ifdef AVSLAM_HAS_ORBBEC_SDK
+    // Priority 1 (non-Airy): Orbbec Gemini 336L / Orbbec USB 200Hz hardware IMU
+    const bool try_orbbec = preferred_imu_id.empty() || (preferred_imu_id == "orbbec_336l_imu");
+    if (try_orbbec) {
+        try {
+            ob::Context::setLoggerSeverity(OB_LOG_SEVERITY_OFF);
+            ob::Context ctx;
+            auto devList = ctx.queryDeviceList();
+            if (devList && devList->getCount() > 0) {
+                auto device = devList->getDevice(0);
+                std::string dev_name = device->getDeviceInfo()->getName();
+                auto accelSensor = device->getSensor(OB_SENSOR_ACCEL);
+                auto gyroSensor = device->getSensor(OB_SENSOR_GYRO);
+                if (accelSensor && gyroSensor) {
+                    ob::Pipeline pipe(device);
+                    auto config = std::make_shared<ob::Config>();
+                    config->enableAccelStream();
+                    config->enableGyroStream();
+                    config->setFrameAggregateOutputMode(OB_FRAME_AGGREGATE_OUTPUT_ALL_TYPE_FRAME_REQUIRE);
+                    pipe.start(config);
+
+                    {
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        status_summary_ = "ACTIVE: " + dev_name + " 200Hz IMU";
+                    }
+
+                    while (running_.load()) {
+                        auto frameSet = pipe.waitForFrameset(100);
+                        if (!frameSet) continue;
+                        auto accelRaw = frameSet->getFrame(OB_FRAME_ACCEL);
+                        auto gyroRaw = frameSet->getFrame(OB_FRAME_GYRO);
+                        if (!accelRaw || !gyroRaw) continue;
+
+                        auto accelFrame = accelRaw->as<ob::AccelFrame>();
+                        auto gyroFrame = gyroRaw->as<ob::GyroFrame>();
+                        if (!accelFrame || !gyroFrame) continue;
+
+                        auto av = accelFrame->getValue();
+                        auto gv = gyroFrame->getValue();
+
+                        // Convert Orbbec optical IMU frame (+X right, +Y down, +Z fwd)
+                        // -> AV-SLAM FLU body frame (+X fwd, +Y left, +Z up)
+                        core::ImuMeasurement meas;
+                        meas.timestamp_sec = nowSteadySec();
+                        meas.accel_mps2 = math::Vec3d(av.z, -av.x, -av.y);
+                        meas.gyro_rads  = math::Vec3d(gv.z, -gv.x, -gv.y);
+                        samples_delivered_.fetch_add(1);
+
+                        ImuCallback cb;
+                        {
+                            std::lock_guard<std::mutex> lock(mutex_);
+                            cb = on_imu_;
+                        }
+                        if (cb) cb(meas);
+                    }
+
+                    pipe.stop();
+                    return;
+                }
+            }
+        } catch (...) {
+            // Fall through to Host PC IMU if Orbbec device is absent or unavailable
+        }
+    }
+#endif
+
 #ifdef _WIN32
     HRESULT hrCom = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     ISensorManager* mgr = nullptr;
@@ -158,7 +250,7 @@ void DesktopImuCapture::captureLoop(std::string preferred_imu_id) {
     if (!accel_sensor && !gyro_sensor) {
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            status_summary_ = "NO_HOST_IMU";
+            status_summary_ = "NO_USB_OR_HOST_IMU";
         }
         if (mgr) mgr->Release();
         if (SUCCEEDED(hrCom)) CoUninitialize();
@@ -189,7 +281,6 @@ void DesktopImuCapture::captureLoop(std::string preferred_imu_id) {
                 if (readSensorFloat(rep, SENSOR_DATA_TYPE_ACCELERATION_X_G, ax) &&
                     readSensorFloat(rep, SENSOR_DATA_TYPE_ACCELERATION_Y_G, ay) &&
                     readSensorFloat(rep, SENSOR_DATA_TYPE_ACCELERATION_Z_G, az)) {
-                    // Convert Windows G-units to m/s^2
                     meas.accel_mps2 = math::Vec3d(ax * kGravityMps2, ay * kGravityMps2, az * kGravityMps2);
                     got_any = true;
                 }
@@ -203,7 +294,6 @@ void DesktopImuCapture::captureLoop(std::string preferred_imu_id) {
                 if (readSensorFloat(rep, SENSOR_DATA_TYPE_ANGULAR_VELOCITY_X_DEGREES_PER_SECOND, gx) &&
                     readSensorFloat(rep, SENSOR_DATA_TYPE_ANGULAR_VELOCITY_Y_DEGREES_PER_SECOND, gy) &&
                     readSensorFloat(rep, SENSOR_DATA_TYPE_ANGULAR_VELOCITY_Z_DEGREES_PER_SECOND, gz)) {
-                    // Convert deg/s to rad/s
                     meas.gyro_rads = math::Vec3d(gx * kDegToRad, gy * kDegToRad, gz * kDegToRad);
                     got_any = true;
                 }
@@ -220,7 +310,7 @@ void DesktopImuCapture::captureLoop(std::string preferred_imu_id) {
             }
             if (cb) cb(meas);
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));  // ~100 Hz
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
     if (accel_sensor) accel_sensor->Release();
@@ -230,7 +320,7 @@ void DesktopImuCapture::captureLoop(std::string preferred_imu_id) {
 #else
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        status_summary_ = "NO_HOST_IMU";
+        status_summary_ = "NO_USB_OR_HOST_IMU";
     }
     running_.store(false);
 #endif

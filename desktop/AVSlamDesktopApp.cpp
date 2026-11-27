@@ -145,6 +145,9 @@ int main(int argc, char** argv) {
                     controller.activeProjectName().c_str(),
                     controller.activeScanName().c_str(),
                     diag.adapter_detected ? "ONLINE" : "OFFLINE");
+        for (const auto& imu : imus) {
+            std::printf("  [IMU] id=%s | name=%s | prio=%d\n", imu.id.c_str(), imu.display_name.c_str(), imu.priority);
+        }
         return 0;
     }
 
