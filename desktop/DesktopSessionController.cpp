@@ -442,16 +442,24 @@ void DesktopSessionController::slamWorkerLoop() {
                             math::SE3d init_guess = target_sm.T_world_keyframe.inverse() * submap.T_world_keyframe;
                             auto ver = gicp_verifier_.verifyLoopConstraint(submap.local_points, target_sm.local_points, init_guess);
                             if (ver.verified) {
-                                pose_graph_.addVerifiedLoopFactor(target_sm.keyframe_id, submap.keyframe_id,
-                                                                  ver.T_target_source, ver.information_diagonal, true);
-                                pose_graph_.optimizeGlobalPoseGraph(15);
-                                last_loop_kf_id_ = submap.keyframe_id;
-                                unclosed_dist_m_ = 0.0;
-                                cached_global_cloud_ = pose_graph_.buildGloballyConsistentPointCloud(2, kDesktopLiveVoxelM);
-                                live_voxel_index_.clear();
-                                for (size_t i = 0; i < cached_global_cloud_.size(); ++i) {
-                                    const auto& p = cached_global_cloud_[i];
-                                    live_voxel_index_[desktopVoxelKey(p.x, p.y, p.z)] = i;
+                                const math::SE3d delta = init_guess.inverse() * ver.T_target_source;
+                                const double delta_rot_deg = delta.so3.log().norm() * math::kRadToDeg;
+                                const double delta_trans_m = delta.t.norm();
+                                const double delta_z_m = std::abs(ver.T_target_source.t.z - init_guess.t.z);
+                                // Strict loop sanity gate: reject floor-to-ceiling or false corridor jumps
+                                if (delta_rot_deg < 15.0 && delta_trans_m < 1.5 && delta_z_m < 0.60 &&
+                                    ver.fitness_rmse_m <= 0.06 && ver.inlier_overlap_ratio >= 0.55) {
+                                    pose_graph_.addVerifiedLoopFactor(target_sm.keyframe_id, submap.keyframe_id,
+                                                                      ver.T_target_source, ver.information_diagonal, true);
+                                    pose_graph_.optimizeGlobalPoseGraph(8);
+                                    last_loop_kf_id_ = submap.keyframe_id;
+                                    unclosed_dist_m_ = 0.0;
+                                    cached_global_cloud_ = pose_graph_.buildGloballyConsistentPointCloud(2, kDesktopLiveVoxelM);
+                                    live_voxel_index_.clear();
+                                    for (size_t i = 0; i < cached_global_cloud_.size(); ++i) {
+                                        const auto& p = cached_global_cloud_[i];
+                                        live_voxel_index_[desktopVoxelKey(p.x, p.y, p.z)] = i;
+                                    }
                                 }
                             }
                         }
@@ -486,6 +494,12 @@ bool DesktopSessionController::saveAndRefineSession() {
         std::vector<core::LidarPointXYZIRT> cleaned;
         last_cleanup_stats_ = processing::PointCloudCleanup::runPostScanPipeline(
             pose_graph_.getSubmaps(), cleaned, cfg);
+        if (last_cleanup_stats_.floor_leveled) {
+            const math::SE3d& T_lvl = last_cleanup_stats_.T_level_world;
+            for (auto& sm : pose_graph_.getMutableSubmaps()) {
+                sm.T_world_keyframe = T_lvl * sm.T_world_keyframe;
+            }
+        }
         if (!cleaned.empty()) {
             cached_global_cloud_ = std::move(cleaned);
         }
