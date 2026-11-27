@@ -43,7 +43,17 @@ public:
             p.rig_config = GenericSensorRigConfig::presetRoboSenseAiry();
             list.push_back(p);
         }
-        // 3. RoboSense Airy Standalone (LiDAR + IMU)
+        // 3. RoboSense Airy + Monocular / Webcam (LiDAR + RGB + IMU, no Depth camera)
+        {
+            UniversalHardwareProfile p;
+            p.profile_id = "airy_monocular_cam";
+            p.display_name = "RoboSense Airy + Monocular / Webcam (LiDAR + RGB + IMU)";
+            p.description = "Airy LiDAR + IMU colorized by onboard webcam or USB monocular RGB camera";
+            p.expected_channels = slam::SENSOR_LIDAR | slam::SENSOR_RGB_CAMERA | slam::SENSOR_IMU;
+            p.rig_config = GenericSensorRigConfig::presetRoboSenseAiry();
+            list.push_back(p);
+        }
+        // 4. RoboSense Airy Standalone (LiDAR + IMU)
         {
             UniversalHardwareProfile p;
             p.profile_id = "airy_standalone";

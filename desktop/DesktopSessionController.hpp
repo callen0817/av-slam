@@ -75,6 +75,7 @@ public:
 
     std::string activeProjectId() const { return active_project_id_; }
     std::string activeProjectName() const { return active_project_name_; }
+    std::string activeScanId() const { return active_scan_id_; }
     std::string activeScanName() const { return active_scan_name_; }
     std::string activeScanFloorLevel() const { return active_scan_floor_level_; }
     std::string activeScanDir() const { return active_scan_dir_; }
@@ -147,6 +148,8 @@ public:
 private:
     static double steadyNowSec();
     static std::string sanitizeId(const std::string& raw, const std::string& fallback);
+    static bool scanDirHasExistingData(const std::string& dir);
+    std::string autoScanLabelForActiveProfile() const;
     void setupCallbacks();
     void slamWorkerLoop();
     void cslamBeaconLoop();
@@ -189,6 +192,7 @@ private:
     std::string active_scan_dir_;
     std::string active_universal_profile_id_{"scanar_v4_airy_336l"};
     std::string active_universal_profile_name_{"ScanAR V4 (RoboSense Airy + Orbbec Gemini 336L)"};
+    bool current_scan_used_{false};
 
     std::mutex mono_rgb_mutex_;
     std::deque<core::RgbFrame> standalone_rgb_queue_;

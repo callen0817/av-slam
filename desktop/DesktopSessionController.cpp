@@ -99,6 +99,42 @@ std::string DesktopSessionController::sanitizeId(const std::string& raw, const s
     return out.empty() ? fallback : out;
 }
 
+bool DesktopSessionController::scanDirHasExistingData(const std::string& dir) {
+    if (dir.empty()) return false;
+    std::error_code ec;
+    fs::path p(dir);
+    if (!fs::exists(p, ec)) return false;
+    if (fs::exists(p / "session.wal", ec) && fs::file_size(p / "session.wal", ec) > 8) return true;
+    if (fs::exists(p / "pose_graph.factors", ec)) return true;
+    if (fs::exists(p / "raw_capture.avraw", ec) && fs::file_size(p / "raw_capture.avraw", ec) > 0) return true;
+    if (fs::exists(p / "chunks", ec)) {
+        for (const auto& entry : fs::directory_iterator(p / "chunks", ec)) {
+            if (entry.is_regular_file()) return true;
+        }
+    }
+    for (const auto& entry : fs::directory_iterator(p, ec)) {
+        if (!entry.is_regular_file()) continue;
+        auto ext = entry.path().extension().string();
+        if (ext == ".ply" || ext == ".pcd" || ext == ".e57") return true;
+    }
+    return false;
+}
+
+std::string DesktopSessionController::autoScanLabelForActiveProfile() const {
+    if (active_universal_profile_id_ == "airy_standalone") return "Scan_Airy";
+    if (active_universal_profile_id_ == "orbbec_gemini_336l_standalone") return "Scan_336L";
+    if (active_universal_profile_id_ == "monocular_camera_standalone") return "Scan_Webcam";
+    if (active_universal_profile_id_ == "airy_monocular_cam") return "Scan_Airy_Webcam";
+    if (active_universal_profile_id_ == "scanar_v4_airy_336l") {
+        std::string ov = camera_.exactCameraNameOverride();
+        if (!ov.empty() && ov.find("Gemini") == std::string::npos && ov.find("Orbbec") == std::string::npos) {
+            return "Scan_Airy_Webcam";
+        }
+        return "Scan_Airy_336L";
+    }
+    return "Scan_" + sanitizeId(active_universal_profile_id_, "Agnostic");
+}
+
 DesktopSessionController::DesktopSessionController() {
     backend::GicpVerificationConfig gicpCfg;
     gicpCfg.voxel_resolution_m = 0.40;
@@ -285,12 +321,20 @@ std::vector<DesktopScanSummary> DesktopSessionController::listScansInActiveProje
 bool DesktopSessionController::createAndSelectScan(const std::string& scan_name, const std::string& floor_level) {
     if (active_project_id_.empty()) createProject("ScanAR_Project", "", "");
     std::string disp = scan_name.empty() ? "Scan" : scan_name;
-    std::string sid = sanitizeId(disp, "SCAN") + "_" + timestampStamp();
-    fs::path sdir = fs::path(projectsRootDir()) / active_project_id_ / "scans" / sid;
+    std::string base_sid = sanitizeId(disp, "SCAN") + "_" + timestampStamp();
+    std::string sid = base_sid;
+    fs::path scans_root = fs::path(projectsRootDir()) / active_project_id_ / "scans";
+    fs::path sdir = scans_root / sid;
     std::error_code ec;
+    int suffix = 2;
+    while (fs::exists(sdir, ec)) {
+        sid = base_sid + "_" + std::to_string(suffix++);
+        sdir = scans_root / sid;
+    }
     fs::create_directories(sdir, ec);
     std::ofstream mf((sdir / "scan_manifest.json").string());
     mf << "{\n  \"id\": \"" << sid << "\",\n  \"name\": \"" << disp
+       << "\",\n  \"profile\": \"" << active_universal_profile_id_
        << "\",\n  \"floorLevel\": \"" << (floor_level.empty() ? "Level 01" : floor_level) << "\"\n}\n";
     active_scan_name_ = disp;
     active_scan_floor_level_ = floor_level.empty() ? "Level 01" : floor_level;
@@ -302,8 +346,9 @@ bool DesktopSessionController::selectScan(const std::string& scan_id) {
     fs::path sdir = fs::path(projectsRootDir()) / active_project_id_ / "scans" / scan_id;
     if (!fs::exists(sdir)) return false;
     active_scan_id_ = scan_id;
-    if (active_scan_name_.empty()) active_scan_name_ = scan_id;
+    active_scan_name_ = scan_id;
     active_scan_dir_ = sdir.string();
+    current_scan_used_ = scanDirHasExistingData(active_scan_dir_);
 
     std::lock_guard<std::mutex> lock(state_mutex_);
     agnostic_engine_.reset();
@@ -317,7 +362,7 @@ bool DesktopSessionController::selectScan(const std::string& scan_id) {
     total_traveled_dist_m_ = 0.0;
     unclosed_dist_m_ = 0.0;
     has_prev_odom_pos_ = false;
-    return project_store_.initializeProject(active_scan_dir_, active_project_id_, active_scan_name_);
+    return true;
 }
 
 bool DesktopSessionController::setActiveDeviceProfile(const std::string& profile_id) {
@@ -377,6 +422,15 @@ sync::SyncDiagnostics DesktopSessionController::currentSyncDiagnostics() const {
 
 bool DesktopSessionController::startScanning() {
     if (is_scanning_.load()) return true;
+
+    // Always allocate a fresh unique scan folder if the current folder already has data
+    // so consecutive scans (Airy, 336L, Webcam, Airy+Webcam, Airy+336L) never overwrite each other.
+    if (active_scan_dir_.empty() || current_scan_used_ || scanDirHasExistingData(active_scan_dir_)) {
+        createAndSelectScan(autoScanLabelForActiveProfile(), active_scan_floor_level_);
+    }
+    project_store_.initializeProject(active_scan_dir_, active_project_id_, active_scan_name_);
+    current_scan_used_ = true;
+
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
         agnostic_engine_.reset();
@@ -394,6 +448,7 @@ bool DesktopSessionController::startScanning() {
         last_loop_kf_id_ = 0;
         has_prev_odom_pos_ = false;
         universal_seq_id_ = 0;
+        last_lidar_arrival_sec_ = 0.0;
         if (factory_calib_.valid) {
             agnostic_engine_.coreEngine().setFactoryCalibration(factory_calib_);
         }
@@ -407,12 +462,21 @@ bool DesktopSessionController::startScanning() {
         standalone_depth_queue_.clear();
     }
 
-    fs::path raw_path = fs::path(active_scan_dir_) / "raw_capture.avraw";
-    udp_receiver_->startRawRecording(raw_path.string());
-    udp_receiver_->start();
-    camera_.start(30);
-    if (active_universal_profile_id_ != "monocular_camera_standalone" &&
-        active_universal_profile_id_ != "airy_standalone") {
+    const bool use_lidar = (active_universal_profile_id_ != "orbbec_gemini_336l_standalone" &&
+                            active_universal_profile_id_ != "monocular_camera_standalone");
+    const bool use_rgb = (active_universal_profile_id_ != "airy_standalone");
+    const bool use_depth = (active_universal_profile_id_ == "scanar_v4_airy_336l" ||
+                            active_universal_profile_id_ == "orbbec_gemini_336l_standalone");
+
+    if (use_lidar) {
+        fs::path raw_path = fs::path(active_scan_dir_) / (active_scan_id_ + "_raw.avraw");
+        udp_receiver_->startRawRecording(raw_path.string());
+        udp_receiver_->start();
+    }
+    if (use_rgb) {
+        camera_.start(30);
+    }
+    if (use_depth) {
         depth_capture_.start();
     }
 
@@ -430,6 +494,7 @@ void DesktopSessionController::stopScanning() {
     camera_.stop();
     depth_capture_.stop();
     udp_receiver_->stopRawRecording();
+    udp_receiver_->stop();
 }
 
 void DesktopSessionController::slamWorkerLoop() {
@@ -511,7 +576,7 @@ void DesktopSessionController::slamWorkerLoop() {
         if (metrics.keyframe_emitted) {
             core::KeyframeSubmap submap;
             submap.keyframe_id = next_keyframe_id_++;
-            submap.timestamp_sec = bundle.lidar_frame.timestamp_end_sec;
+            submap.timestamp_sec = u_bundle.timestamp_sec;
             submap.T_world_keyframe = state.T_world_body;
             submap.local_points = deskewed_body.points;
 
@@ -520,7 +585,7 @@ void DesktopSessionController::slamWorkerLoop() {
             keyframe_traveled_dist_[submap.keyframe_id] = total_traveled_dist_m_;
 
             auto sc_desc = backend::ScanContextDatabase::computeDescriptor(
-                submap.keyframe_id, submap.timestamp_sec, submap.local_points, bundle.rgb_frame);
+                submap.keyframe_id, submap.timestamp_sec, submap.local_points, u_bundle.rgb_frame);
             auto loop_cand = sc_db_.detectLoopClosure(sc_desc);
             sc_db_.addKeyframeDescriptor(sc_desc);
 
@@ -600,7 +665,14 @@ bool DesktopSessionController::saveAndRefineSession() {
             cached_global_cloud_, pose_graph_.getSubmaps(), pose_graph_.getFactors(), 0.08);
     }
     std::vector<storage::PoiPhotoRecord> empty_pois;
-    return project_store_.saveProjectSession(calib_profile_, pose_graph_.getSubmaps(), pose_graph_.getFactors(), empty_pois);
+    bool ok = project_store_.saveProjectSession(calib_profile_, pose_graph_.getSubmaps(), pose_graph_.getFactors(), empty_pois);
+    if (!cached_global_cloud_.empty() && !active_scan_dir_.empty()) {
+        std::string base = active_scan_id_.empty() ? ("scan_" + timestampStamp()) : active_scan_id_;
+        exporters::PointCloudExporter::exportToPly(
+            (fs::path(active_scan_dir_) / (base + ".ply")).string(), cached_global_cloud_, true);
+    }
+    current_scan_used_ = true;
+    return ok;
 }
 
 bool DesktopSessionController::startTerrestrialStation(double step_deg, bool is_flash_during_slam) {

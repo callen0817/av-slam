@@ -605,10 +605,11 @@ int main(int argc, char** argv) {
                 export_status = ok ? "Exported Spatial Bundle!" : "Bundle export failed.";
             }
             if (ImGui::Button("Export PLY + PCD + E57")) {
-                bool ok1 = controller.exportPly((std::filesystem::path(dir) / "avscan_map.ply").string());
-                bool ok2 = controller.exportPcd((std::filesystem::path(dir) / "avscan_map.pcd").string());
-                bool ok3 = controller.exportE57((std::filesystem::path(dir) / "avscan_map.e57").string());
-                export_status = (ok1 && ok2 && ok3) ? "Exported PLY/PCD/E57!" : "Partial export.";
+                std::string base = controller.activeScanId().empty() ? "avscan_map" : controller.activeScanId();
+                bool ok1 = controller.exportPly((std::filesystem::path(dir) / (base + ".ply")).string());
+                bool ok2 = controller.exportPcd((std::filesystem::path(dir) / (base + ".pcd")).string());
+                bool ok3 = controller.exportE57((std::filesystem::path(dir) / (base + ".e57")).string());
+                export_status = (ok1 && ok2 && ok3) ? ("Exported " + base + " (.ply/.pcd/.e57)!") : "Partial export.";
             }
             ImGui::End();
         }
