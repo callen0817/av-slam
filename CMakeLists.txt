@@ -23,6 +23,7 @@ set(AVSLAM_CORE_SOURCES
     src/sensors/AiryDecoder.cpp
     src/sensors/AiryUdpReceiver.cpp
     src/sensors/DepthProviderRegistry.cpp
+    src/sensors/GnssRtkReceiver.cpp
     src/sensors/LivoxMid360Adapter.cpp
     src/sensors/OusterAdapter.cpp
     src/cslam/CollaborativeSlamEngine.cpp
@@ -34,6 +35,7 @@ set(AVSLAM_CORE_SOURCES
     src/slam/AvImuPreintegrator.cpp
     src/slam/AvSurfelMap.cpp
     src/slam/AvSlamEngine.cpp
+    src/slam/SensorAgnosticSlamEngine.cpp
     src/calibration/TargetlessCalibrator.cpp
     src/calibration/OnlineAutoCalibrator.cpp
     src/backend/ScanContext.cpp
@@ -148,6 +150,10 @@ if(AVSLAM_BUILD_TESTS AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
     add_executable(avslam_cslam_depth_test tests/test_cslam_and_depth.cpp)
     target_link_libraries(avslam_cslam_depth_test PRIVATE avslam_core)
     add_test(NAME CslamAndDepthTest COMMAND avslam_cslam_depth_test)
+
+    add_executable(avslam_agnostic_test tests/test_sensor_agnostic_slam.cpp)
+    target_link_libraries(avslam_agnostic_test PRIVATE avslam_core)
+    add_test(NAME SensorAgnosticSlamTest COMMAND avslam_agnostic_test)
 
     add_executable(avslam_live_regression_test tests/test_live_scan_regression.cpp)
     target_link_libraries(avslam_live_regression_test PRIVATE avslam_core)
