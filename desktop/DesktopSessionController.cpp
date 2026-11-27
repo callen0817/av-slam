@@ -193,6 +193,16 @@ DesktopSessionController::DesktopSessionController() {
     } else {
         createProject("ScanAR_Project_01", "Default Site", "");
     }
+    refreshDetectedHardware();
+}
+
+void DesktopSessionController::refreshDetectedHardware() {
+    bool airy_ok = false;
+    if (discovery_) {
+        auto diag = discovery_->runDiagnostics(120, 120);
+        airy_ok = diag.adapter_detected || diag.difop_received || diag.http_reachable;
+    }
+    hw_manager_.refreshConnectedHardware(airy_ok, net_config_.sensor_ip);
 }
 
 DesktopSessionController::~DesktopSessionController() {

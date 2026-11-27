@@ -148,6 +148,15 @@ int main(int argc, char** argv) {
         for (const auto& imu : imus) {
             std::printf("  [IMU] id=%s | name=%s | prio=%d\n", imu.id.c_str(), imu.display_name.c_str(), imu.priority);
         }
+        auto hw_devs = controller.detectedHardwareDevices();
+        std::printf("  [HW] online=%s | detected=%zu\n", controller.isHardwareManagerOnline() ? "YES" : "NO", hw_devs.size());
+        for (const auto& d : hw_devs) {
+            std::printf("    - [%s] %s (%s) -> %s\n",
+                        avscan::sensors::HardwareRegistry::busToString(d.fingerprint.bus).c_str(),
+                        d.fingerprint.friendly_name.c_str(),
+                        d.fingerprint.vid_pid.c_str(),
+                        d.status_message.c_str());
+        }
         return 0;
     }
 
@@ -181,6 +190,7 @@ int main(int argc, char** argv) {
     bool show_airy_window = false;
     bool show_calib_window = false;
     bool show_export_modal = false;
+    bool show_hardware_window = controller.hasPendingHardwareOptimization();
 
     char new_proj_name[128] = "Site_Project_01";
     char new_proj_site[128] = "Building A";
@@ -328,6 +338,18 @@ int main(int argc, char** argv) {
             if (ImGui::Button("Airy Net")) {
                 show_airy_window = !show_airy_window;
                 if (show_airy_window) last_diag = controller.runAiryDiagnostics();
+            }
+            {
+                auto hw_cnt = controller.detectedHardwareDevices().size();
+                char hw_btn[48];
+                if (controller.hasPendingHardwareOptimization()) {
+                    std::snprintf(hw_btn, sizeof(hw_btn), "Hardware (%zu !)", hw_cnt);
+                } else {
+                    std::snprintf(hw_btn, sizeof(hw_btn), "Hardware (%zu)", hw_cnt);
+                }
+                if (ImGui::Button(hw_btn)) {
+                    show_hardware_window = !show_hardware_window;
+                }
             }
             if (ImGui::Button("Calibrate")) show_calib_window = !show_calib_window;
 
@@ -652,6 +674,59 @@ int main(int argc, char** argv) {
                         rpy.x * avscan::math::kRadToDeg,
                         rpy.y * avscan::math::kRadToDeg,
                         rpy.z * avscan::math::kRadToDeg);
+            ImGui::End();
+        }
+
+        // Hardware Auto-Detector, Online Capability Lookup & SDK Provisioner Window
+        if (show_hardware_window) {
+            ImGui::Begin("Hardware Auto-Detector & SDK Manager", &show_hardware_window, ImGuiWindowFlags_AlwaysAutoResize);
+            bool is_online = controller.isHardwareManagerOnline();
+            if (is_online) {
+                ImGui::TextColored(ImVec4(0.29f, 0.87f, 0.50f, 1.0f), "Network: ONLINE — Capability lookup & SDK auto-install available");
+            } else {
+                ImGui::TextColored(ImVec4(0.98f, 0.75f, 0.25f, 1.0f),
+                                   "Network: OFFLINE — Running plug-and-play fallback. Go online to optimize new devices.");
+            }
+            if (ImGui::Button("Refresh Connected Hardware")) {
+                controller.refreshDetectedHardware();
+            }
+            ImGui::SameLine();
+            ImGui::TextDisabled("Status: %s", controller.hardwareProvisioningStatus().c_str());
+            ImGui::Separator();
+
+            auto hw_list = controller.detectedHardwareDevices();
+            if (hw_list.empty()) {
+                ImGui::TextDisabled("No external sensors detected yet. Plug in a LiDAR, Depth Camera, or Webcam and click Refresh.");
+            }
+            for (size_t i = 0; i < hw_list.size(); ++i) {
+                const auto& d = hw_list[i];
+                ImGui::PushID(static_cast<int>(i));
+                ImGui::TextColored(ImVec4(0.90f, 0.79f, 0.51f, 1.0f), "[%s] %s  (%s)",
+                                   avscan::sensors::HardwareRegistry::busToString(d.fingerprint.bus).c_str(),
+                                   d.matched_registry ? d.registry_entry.display_name.c_str() : d.fingerprint.friendly_name.c_str(),
+                                   d.fingerprint.vid_pid.c_str());
+                if (d.matched_registry) {
+                    ImGui::BulletText("Capabilities: %s",
+                                      avscan::slam::SensorAgnosticSlamEngine::describeChannelMask(d.registry_entry.capabilities).c_str());
+                }
+                ImVec4 st_col = (d.state == avscan::sensors::HardwareOptimizationState::OPTIMIZED_NATIVE)
+                    ? ImVec4(0.29f, 0.87f, 0.50f, 1.0f)
+                    : ImVec4(0.98f, 0.75f, 0.25f, 1.0f);
+                ImGui::TextColored(st_col, "  %s", d.status_message.c_str());
+
+                bool busy = controller.isHardwareProvisioningBusy();
+                if (d.state == avscan::sensors::HardwareOptimizationState::PLUG_AND_PLAY_BASIC && is_online && !busy) {
+                    if (ImGui::Button(("Optimize: Download & Install " + d.registry_entry.sdk_name).c_str())) {
+                        controller.installHardwareSdk(d.registry_entry.device_id);
+                    }
+                } else if (d.state == avscan::sensors::HardwareOptimizationState::UNKNOWN_NEEDS_LOOKUP && is_online && !busy) {
+                    if (ImGui::Button("Look Up Device Online & Create Profile")) {
+                        controller.lookupUnknownHardwareOnline(d.fingerprint.vid_pid, d.fingerprint.friendly_name);
+                    }
+                }
+                ImGui::Separator();
+                ImGui::PopID();
+            }
             ImGui::End();
         }
 

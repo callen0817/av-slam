@@ -2,6 +2,7 @@
 
 #include "DesktopCameraCapture.hpp"
 #include "DesktopDepthCapture.hpp"
+#include "DesktopHardwareManager.hpp"
 #include "DesktopImuCapture.hpp"
 #include "avscan/backend/GicpVerifier.hpp"
 #include "avscan/backend/PoseGraphOptimizer.hpp"
@@ -172,6 +173,20 @@ public:
     void setImuSelection(SensorSelectionMode mode, const std::string& imu_id = "");
     void setGnssSelection(SensorSelectionMode mode) { sensor_toggles_.gnss_mode = mode; }
 
+    // Hardware Auto-Detector, Online Capability Lookup & SDK Provisioner
+    void refreshDetectedHardware();
+    std::vector<sensors::DetectedHardwareDevice> detectedHardwareDevices() const { return hw_manager_.detectedDevices(); }
+    bool isHardwareManagerOnline() const { return hw_manager_.isOnline(); }
+    bool hasPendingHardwareOptimization() const { return hw_manager_.hasPendingOptimizationPrompt(); }
+    bool isHardwareProvisioningBusy() const { return hw_manager_.isProvisioningBusy(); }
+    std::string hardwareProvisioningStatus() const { return hw_manager_.provisioningStatus(); }
+    void lookupUnknownHardwareOnline(const std::string& vid_pid, const std::string& name) {
+        hw_manager_.lookupUnknownDeviceOnlineAsync(vid_pid, name);
+    }
+    void installHardwareSdk(const std::string& device_id) {
+        hw_manager_.installSdkForDeviceAsync(device_id);
+    }
+
 private:
     static double steadyNowSec();
     static std::string sanitizeId(const std::string& raw, const std::string& fallback);
@@ -187,6 +202,7 @@ private:
     DesktopCameraCapture camera_;
     DesktopDepthCapture depth_capture_;
     DesktopImuCapture host_imu_;
+    DesktopHardwareManager hw_manager_;
     DesktopSensorToggles sensor_toggles_{};
 
     sync::TimeSynchronizer synchronizer_;

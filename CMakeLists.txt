@@ -48,6 +48,7 @@ set(AVSLAM_CORE_SOURCES
     src/core/DeviceMountProfile.cpp
     src/system/ResourceController.cpp
     src/terrestrial/TerrestrialStationManager.cpp
+    src/sensors/HardwareRegistry.cpp
 )
 
 add_library(avslam_core STATIC ${AVSLAM_CORE_SOURCES})
@@ -202,6 +203,7 @@ if(AVSLAM_BUILD_DESKTOP_APP AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
         desktop/DesktopCameraCapture.cpp
         desktop/DesktopDepthCapture.cpp
         desktop/DesktopImuCapture.cpp
+        desktop/DesktopHardwareManager.cpp
         ${imgui_SOURCE_DIR}/imgui.cpp
         ${imgui_SOURCE_DIR}/imgui_draw.cpp
         ${imgui_SOURCE_DIR}/imgui_tables.cpp
@@ -241,7 +243,7 @@ if(AVSLAM_BUILD_DESKTOP_APP AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
     endif()
 
     if(WIN32)
-        target_link_libraries(AVSlamDesktop PRIVATE mf mfplat mfreadwrite mfuuid ole32 sensorsapi portabledeviceguids)
+        target_link_libraries(AVSlamDesktop PRIVATE mf mfplat mfreadwrite mfuuid ole32 sensorsapi portabledeviceguids winhttp)
     elseif(UNIX AND NOT APPLE)
         target_link_libraries(AVSlamDesktop PRIVATE pthread dl)
     endif()
