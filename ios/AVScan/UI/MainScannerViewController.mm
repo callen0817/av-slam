@@ -388,6 +388,22 @@
         [weakSelf openProjectSwitcher];
     }]];
 
+    auto cslamStats = [_bridge collaborativeSlamStats];
+    NSString *joinTitle = (cslamStats.discovered_peers > 0)
+        ? [NSString stringWithFormat:@"● Join Live C-SLAM Scan (%zu active)...", cslamStats.discovered_peers]
+        : @"Join Live C-SLAM Scan (Guest / Slave)...";
+    [sheet addAction:[UIAlertAction actionWithTitle:joinTitle
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *action) {
+        MainScannerViewController *strongSelf = weakSelf;
+        if (!strongSelf) return;
+        if (!strongSelf->_bridge.isCslamEnabled) {
+            [strongSelf->_bridge setCollaborativeSlamEnabled:YES];
+            [strongSelf updateCslamButtonTitle];
+        }
+        [strongSelf openCslamConnectMenu];
+    }]];
+
     [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:sheet animated:YES completion:nil];
 }
@@ -417,6 +433,7 @@
         NSString *notes = alert.textFields[2].text;
         [strongSelf->_bridge createProjectWithName:name site:site notes:notes outProjectId:nil];
         [strongSelf updateProjectButtonTitle];
+        [strongSelf promptCreateNewScan];
     }]];
     [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:alert animated:YES completion:nil];
