@@ -367,6 +367,27 @@ int main(int argc, char** argv) {
 
             {
                 auto tog = controller.sensorToggles();
+                if (ImGui::BeginMenu("Primary")) {
+                    if (ImGui::MenuItem("Auto (LiDAR > Depth > Monocular)", nullptr,
+                                        tog.primary_geometry == avscan::desktop::PrimaryGeometrySensorMode::AUTO_BEST)) {
+                        controller.setPrimaryGeometryMode(avscan::desktop::PrimaryGeometrySensorMode::AUTO_BEST);
+                    }
+                    ImGui::Separator();
+                    if (ImGui::MenuItem("Force LiDAR Primary", nullptr,
+                                        tog.primary_geometry == avscan::desktop::PrimaryGeometrySensorMode::FORCE_LIDAR)) {
+                        controller.setPrimaryGeometryMode(avscan::desktop::PrimaryGeometrySensorMode::FORCE_LIDAR);
+                    }
+                    if (ImGui::MenuItem("Force Depth Primary (336L / RGB-D)", nullptr,
+                                        tog.primary_geometry == avscan::desktop::PrimaryGeometrySensorMode::FORCE_DEPTH)) {
+                        controller.setPrimaryGeometryMode(avscan::desktop::PrimaryGeometrySensorMode::FORCE_DEPTH);
+                    }
+                    if (ImGui::MenuItem("Force Monocular Primary (RGB Only)", nullptr,
+                                        tog.primary_geometry == avscan::desktop::PrimaryGeometrySensorMode::FORCE_MONOCULAR)) {
+                        controller.setPrimaryGeometryMode(avscan::desktop::PrimaryGeometrySensorMode::FORCE_MONOCULAR);
+                    }
+                    ImGui::EndMenu();
+                }
+
                 if (ImGui::BeginMenu("LiDAR")) {
                     if (ImGui::MenuItem("Auto (RoboSense Airy UDP)", nullptr, tog.lidar_mode == avscan::desktop::SensorSelectionMode::AUTO)) {
                         controller.setLidarSelection(avscan::desktop::SensorSelectionMode::AUTO);
@@ -405,7 +426,8 @@ int main(int argc, char** argv) {
                 }
 
                 if (ImGui::BeginMenu("IMU")) {
-                    if (ImGui::MenuItem("Auto (Best: Airy > Host/USB IMU)", nullptr, tog.imu_mode == avscan::desktop::SensorSelectionMode::AUTO)) {
+                    if (ImGui::MenuItem("Auto (Best: uINS-3/IMX-5 > Airy > 336L > Host)", nullptr,
+                                        tog.imu_mode == avscan::desktop::SensorSelectionMode::AUTO)) {
                         controller.setImuSelection(avscan::desktop::SensorSelectionMode::AUTO);
                     }
                     if (ImGui::MenuItem("None (Off)", nullptr, tog.imu_mode == avscan::desktop::SensorSelectionMode::DISABLED_NONE)) {
@@ -459,7 +481,7 @@ int main(int argc, char** argv) {
 
         // Top-Left HUD Status & Metrics Card
         ImGui::SetNextWindowPos(ImVec2(14, 34), ImGuiCond_Always);
-        ImGui::SetNextWindowSize(ImVec2(480, 192), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(500, 212), ImGuiCond_Always);
         ImGui::Begin("##HudStatus", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove);
         ImGui::TextColored(ImVec4(0.90f, 0.79f, 0.51f, 1.0f), "%s  |  %s (%s)",
                            controller.activeProjectName().c_str(),
@@ -468,7 +490,7 @@ int main(int argc, char** argv) {
         ImGui::TextColored(ImVec4(0.22f, 0.74f, 0.97f, 1.0f), "AGNOSTIC MODE: %s  |  RTK: %s",
                            agnostic_status.mode_summary.c_str(),
                            agnostic_status.gnss_rtk_locked ? "LOCKED" : "STANDBY");
-        ImGui::Text("PROFILE: %s", controller.activeUniversalProfileName().c_str());
+        ImGui::Text("PRIMARY: %s", controller.primaryGeometryStatusSummary().c_str());
         ImGui::Text("PTS: %zu  |  LOOPS: %zu  |  LOSS: %.2f%%  |  %.1f ms/sweep",
                     cloud.size(), controller.loopClosureCount(),
                     pkt.msopPacketLossRatio() * 100.0, slam_stats.avg_frame_ms);

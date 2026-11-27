@@ -231,6 +231,11 @@ void DesktopSessionController::setupCallbacks() {
                 sensor_toggles_.imu_source_id != "airy_imu") {
                 return;
             }
+            // In AUTO mode, yield to higher-priority Inertial Sense uINS-3/IMX-5 (Prio 120) if live!
+            if (sensor_toggles_.imu_mode == SensorSelectionMode::AUTO &&
+                inertial_sense_.isStreamingLive()) {
+                return;
+            }
             double now = steadyNowSec();
             if (!is_terrestrial_active_.load()) {
                 synchronizer_.pushImu(imu, now);
@@ -277,20 +282,49 @@ void DesktopSessionController::setupCallbacks() {
     host_imu_.setImuCallback([this](const core::ImuMeasurement& imu) {
         if (sensor_toggles_.imu_mode == SensorSelectionMode::DISABLED_NONE) return;
         if (sensor_toggles_.imu_mode == SensorSelectionMode::ENABLED_SPECIFIC &&
-            sensor_toggles_.imu_source_id == "airy_imu") {
+            (sensor_toggles_.imu_source_id == "airy_imu" || sensor_toggles_.imu_source_id == "inertial_sense_imu")) {
+            return;
+        }
+        // In AUTO mode, yield to higher-priority Inertial Sense (Prio 120) if live!
+        if (sensor_toggles_.imu_mode == SensorSelectionMode::AUTO &&
+            inertial_sense_.isStreamingLive()) {
             return;
         }
         if (!is_terrestrial_active_.load()) {
             std::lock_guard<std::mutex> lk(mono_rgb_mutex_);
             standalone_imu_queue_.push_back(imu);
             while (standalone_imu_queue_.size() > 120) standalone_imu_queue_.pop_front();
-            // If user explicitly chose Host IMU while LiDAR is running, also feed synchronizer
+            // If user explicitly chose Orbbec/Host IMU while LiDAR is running, also feed synchronizer
             if (sensor_toggles_.imu_mode == SensorSelectionMode::ENABLED_SPECIFIC &&
                 sensor_toggles_.imu_source_id != "airy_imu") {
                 synchronizer_.pushImu(imu, steadyNowSec());
             }
         }
     });
+
+    // Priority-1 (120) Inertial Sense uINS-3 RUG-3 / IMX-5 Dual RTK IMU + NMEA RTK callback
+    inertial_sense_.setCallbacks(
+        [this](const core::ImuMeasurement& imu) {
+            if (sensor_toggles_.imu_mode == SensorSelectionMode::DISABLED_NONE) return;
+            if (sensor_toggles_.imu_mode == SensorSelectionMode::ENABLED_SPECIFIC &&
+                sensor_toggles_.imu_source_id != "inertial_sense_imu") {
+                return;
+            }
+            double now = steadyNowSec();
+            if (!is_terrestrial_active_.load()) {
+                synchronizer_.pushImu(imu, now);
+                std::lock_guard<std::mutex> lk(mono_rgb_mutex_);
+                standalone_imu_queue_.push_back(imu);
+                while (standalone_imu_queue_.size() > 160) standalone_imu_queue_.pop_front();
+            } else if (station_manager_) {
+                station_manager_->pushImuMeasurement(imu);
+            }
+        },
+        [this](const std::string& nmea_gga) {
+            if (sensor_toggles_.gnss_mode != SensorSelectionMode::DISABLED_NONE) {
+                injectNmeaGnssSentence(nmea_gga);
+            }
+        });
 }
 
 std::string DesktopSessionController::projectsRootDir() const {
@@ -472,28 +506,73 @@ void DesktopSessionController::setImuSelection(SensorSelectionMode mode, const s
 
 std::vector<DetectedImuInfo> DesktopSessionController::availableImuSources() const {
     std::vector<DetectedImuInfo> out;
+    auto is_ports = inertial_sense_.enumerateCandidatePorts();
+    if (!is_ports.empty()) {
+        out.push_back({"inertial_sense_imu",
+                       "Inertial Sense uINS-3 / IMX-5 Dual RTK IMU (" + is_ports.front().port_name + ")",
+                       120, true});
+    } else {
+        out.push_back({"inertial_sense_imu",
+                       "Inertial Sense uINS-3 / IMX-5 Dual RTK IMU (Auto Serial)",
+                       120, true});
+    }
     out.push_back({"airy_imu", "RoboSense Airy 200Hz IMU (Ethernet)", 100, true});
     auto host_imus = host_imu_.enumerateAvailableImus();
     out.insert(out.end(), host_imus.begin(), host_imus.end());
+    std::sort(out.begin(), out.end(), [](const DetectedImuInfo& a, const DetectedImuInfo& b) {
+        return a.priority > b.priority;
+    });
     return out;
+}
+
+std::string DesktopSessionController::primaryGeometryStatusSummary() const {
+    switch (sensor_toggles_.primary_geometry) {
+        case PrimaryGeometrySensorMode::FORCE_LIDAR:     return "MANUAL -> LiDAR";
+        case PrimaryGeometrySensorMode::FORCE_DEPTH:     return "MANUAL -> Depth Camera";
+        case PrimaryGeometrySensorMode::FORCE_MONOCULAR: return "MANUAL -> Monocular RGB";
+        case PrimaryGeometrySensorMode::AUTO_BEST:
+        default: {
+            if (sensor_toggles_.lidar_mode != SensorSelectionMode::DISABLED_NONE &&
+                (steadyNowSec() - last_lidar_arrival_sec_) <= 0.5) {
+                return "AUTO -> LiDAR (LiDAR > Depth > Mono)";
+            }
+            if (sensor_toggles_.depth_mode != SensorSelectionMode::DISABLED_NONE && depth_capture_.isRunning()) {
+                return "AUTO -> Depth (LiDAR > Depth > Mono)";
+            }
+            if (sensor_toggles_.rgb_mode != SensorSelectionMode::DISABLED_NONE && camera_.isRunning()) {
+                return "AUTO -> Monocular (LiDAR > Depth > Mono)";
+            }
+            return "AUTO (LiDAR > Depth > Mono)";
+        }
+    }
 }
 
 std::string DesktopSessionController::imuStatusSummary() const {
     if (sensor_toggles_.imu_mode == SensorSelectionMode::DISABLED_NONE) return "OFF (None)";
-    if (sensor_toggles_.imu_mode == SensorSelectionMode::ENABLED_SPECIFIC &&
-        sensor_toggles_.imu_source_id == "airy_imu") {
-        return (udp_receiver_ && udp_receiver_->getPacketStats().imu_packets_valid > 0)
-            ? "ACTIVE: Airy 200Hz IMU" : "WAITING: Airy 200Hz IMU";
+    if (sensor_toggles_.imu_mode == SensorSelectionMode::ENABLED_SPECIFIC) {
+        if (sensor_toggles_.imu_source_id == "inertial_sense_imu") {
+            return inertial_sense_.isStreamingLive()
+                ? ("MANUAL -> " + inertial_sense_.statusSummary())
+                : "MANUAL -> Waiting for uINS-3 / IMX-5 Serial";
+        }
+        if (sensor_toggles_.imu_source_id == "airy_imu") {
+            return (udp_receiver_ && udp_receiver_->getPacketStats().imu_packets_valid > 0)
+                ? "MANUAL -> Airy 200Hz IMU" : "MANUAL -> Waiting for Airy IMU";
+        }
+        return host_imu_.isRunning() ? ("MANUAL -> " + host_imu_.statusSummary()) : ("MANUAL -> " + sensor_toggles_.imu_source_id);
+    }
+    // AUTO (Best) priority readout: Inertial Sense (120) > Airy (100) > Orbbec 336L (85) > Host (65)
+    if (inertial_sense_.isStreamingLive()) {
+        return "AUTO -> Inertial Sense uINS-3/IMX-5 (Prio 120)";
     }
     if (udp_receiver_ && udp_receiver_->getPacketStats().imu_packets_valid > 0 &&
-        sensor_toggles_.lidar_mode != SensorSelectionMode::DISABLED_NONE &&
-        sensor_toggles_.imu_mode == SensorSelectionMode::AUTO) {
-        return "AUTO -> Airy 200Hz IMU";
+        sensor_toggles_.lidar_mode != SensorSelectionMode::DISABLED_NONE) {
+        return "AUTO -> Airy 200Hz IMU (Prio 100)";
     }
-    if (host_imu_.isRunning()) {
-        return host_imu_.statusSummary();
+    if (host_imu_.isRunning() && host_imu_.samplesDelivered() > 0) {
+        return "AUTO -> " + host_imu_.statusSummary() + " (Prio 85)";
     }
-    return "AUTO (Airy / Host IMU)";
+    return "AUTO (uINS-3/IMX-5 > Airy > 336L > Host)";
 }
 
 slam::AgnosticSlamStatus DesktopSessionController::currentAgnosticStatus() const {
@@ -570,12 +649,20 @@ bool DesktopSessionController::startScanning() {
         standalone_imu_queue_.clear();
     }
 
-    const bool use_lidar = (sensor_toggles_.lidar_mode != SensorSelectionMode::DISABLED_NONE);
+    const bool use_lidar = (sensor_toggles_.lidar_mode != SensorSelectionMode::DISABLED_NONE) &&
+                           (sensor_toggles_.primary_geometry != PrimaryGeometrySensorMode::FORCE_DEPTH) &&
+                           (sensor_toggles_.primary_geometry != PrimaryGeometrySensorMode::FORCE_MONOCULAR);
     const bool use_rgb   = (sensor_toggles_.rgb_mode != SensorSelectionMode::DISABLED_NONE);
-    const bool use_depth = (sensor_toggles_.depth_mode != SensorSelectionMode::DISABLED_NONE);
+    const bool use_depth = (sensor_toggles_.depth_mode != SensorSelectionMode::DISABLED_NONE) &&
+                           (sensor_toggles_.primary_geometry != PrimaryGeometrySensorMode::FORCE_MONOCULAR);
+    const bool use_inertial_sense = (sensor_toggles_.imu_mode == SensorSelectionMode::AUTO) ||
+                                    (sensor_toggles_.imu_mode == SensorSelectionMode::ENABLED_SPECIFIC &&
+                                     sensor_toggles_.imu_source_id == "inertial_sense_imu") ||
+                                    (sensor_toggles_.gnss_mode != SensorSelectionMode::DISABLED_NONE);
     const bool use_host_imu = (sensor_toggles_.imu_mode == SensorSelectionMode::AUTO) ||
                               (sensor_toggles_.imu_mode == SensorSelectionMode::ENABLED_SPECIFIC &&
-                               sensor_toggles_.imu_source_id != "airy_imu");
+                               sensor_toggles_.imu_source_id != "airy_imu" &&
+                               sensor_toggles_.imu_source_id != "inertial_sense_imu");
 
     if (use_lidar) {
         fs::path raw_path = fs::path(active_scan_dir_) / (active_scan_id_ + "_raw.avraw");
@@ -587,6 +674,9 @@ bool DesktopSessionController::startScanning() {
     }
     if (use_depth) {
         depth_capture_.start();
+    }
+    if (use_inertial_sense) {
+        inertial_sense_.start();
     }
     if (use_host_imu) {
         host_imu_.start(sensor_toggles_.imu_source_id);
@@ -605,6 +695,7 @@ void DesktopSessionController::stopScanning() {
     }
     camera_.stop();
     depth_capture_.stop();
+    inertial_sense_.stop();
     host_imu_.stop();
     udp_receiver_->stopRawRecording();
     udp_receiver_->stop();

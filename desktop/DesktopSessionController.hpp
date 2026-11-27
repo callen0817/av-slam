@@ -4,6 +4,7 @@
 #include "DesktopDepthCapture.hpp"
 #include "DesktopHardwareManager.hpp"
 #include "DesktopImuCapture.hpp"
+#include "DesktopInertialSenseCapture.hpp"
 #include "avscan/backend/GicpVerifier.hpp"
 #include "avscan/backend/PoseGraphOptimizer.hpp"
 #include "avscan/backend/ScanContext.hpp"
@@ -49,7 +50,15 @@ enum class SensorSelectionMode {
     DISABLED_NONE = 2
 };
 
+enum class PrimaryGeometrySensorMode {
+    AUTO_BEST = 0,        // Automatic priority: LiDAR > Depth Camera > Monocular RGB
+    FORCE_LIDAR = 1,      // Force LiDAR as primary pose estimator
+    FORCE_DEPTH = 2,      // Force Depth Camera (e.g. 336L) as primary pose estimator
+    FORCE_MONOCULAR = 3   // Force Monocular RGB Camera as primary pose estimator
+};
+
 struct DesktopSensorToggles {
+    PrimaryGeometrySensorMode primary_geometry{PrimaryGeometrySensorMode::AUTO_BEST};
     SensorSelectionMode lidar_mode{SensorSelectionMode::AUTO};
     SensorSelectionMode rgb_mode{SensorSelectionMode::AUTO};
     std::string rgb_device_name;
@@ -165,8 +174,10 @@ public:
     void selectCameraOverride(const std::string& exact_name);
     std::string selectedCameraOverride() const { return camera_.exactCameraNameOverride(); }
 
-    // Per-Sensor Toggles (Auto / Specific Device / None-Off)
+    // Per-Sensor Toggles (Auto / Specific Device / None-Off) & Primary Sensor Arbitration
     DesktopSensorToggles sensorToggles() const { return sensor_toggles_; }
+    void setPrimaryGeometryMode(PrimaryGeometrySensorMode m) { sensor_toggles_.primary_geometry = m; }
+    std::string primaryGeometryStatusSummary() const;
     void setLidarSelection(SensorSelectionMode mode) { sensor_toggles_.lidar_mode = mode; }
     void setRgbSelection(SensorSelectionMode mode, const std::string& exact_name = "");
     void setDepthSelection(SensorSelectionMode mode) { sensor_toggles_.depth_mode = mode; }
@@ -202,6 +213,7 @@ private:
     DesktopCameraCapture camera_;
     DesktopDepthCapture depth_capture_;
     DesktopImuCapture host_imu_;
+    DesktopInertialSenseCapture inertial_sense_;
     DesktopHardwareManager hw_manager_;
     DesktopSensorToggles sensor_toggles_{};
 

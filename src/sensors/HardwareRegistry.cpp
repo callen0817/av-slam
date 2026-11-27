@@ -167,7 +167,26 @@ void HardwareRegistry::populateBuiltInCatalog() {
         entries_.push_back(e);
     }
 
-    // 7. u-blox ZED-F9P / Emlid Reach RTK-GNSS
+    // 7. Inertial Sense uINS-3 RUG-3 & IMX-5 Dual RTK (Native Serial $PIMU + $GNGGA)
+    {
+        HardwareRegistryEntry e;
+        e.device_id = "inertial_sense_uins3_imx5";
+        e.display_name = "Inertial Sense uINS-3 RUG-3 / IMX-5 Dual RTK (Nav-Grade IMU + RTK)";
+        e.vendor = "Inertial Sense";
+        e.vid_pid_prefixes = {"0403:6001", "0403:6015", "0483:5740", "10C4:EA60"};
+        e.capabilities = slam::SENSOR_IMU | slam::SENSOR_GNSS_RTK;
+        e.recommended_profile_id = "outdoor_rtk_multisensor";
+        e.sdk_name = "AV-SLAM Native Inertial Sense Protocol ($PIMU/$GNGGA)";
+        e.sdk_license = "MIT / Proprietary Native";
+        e.sdk_download_url_win64 = "https://github.com/inertialsense/inertial-sense-sdk/releases/latest";
+        e.sdk_download_url_linux_x64 = "https://github.com/inertialsense/inertial-sense-sdk/releases/latest";
+        e.sdk_download_url_linux_arm64 = "https://github.com/inertialsense/inertial-sense-sdk/releases/latest";
+        e.optimization_summary = "Priority-1 nav-grade 200-1000Hz IMU + cm-grade Dual-RTK GPS built in";
+        e.built_in_native = true;
+        entries_.push_back(e);
+    }
+
+    // 8. u-blox ZED-F9P / Emlid Reach RTK-GNSS
     {
         HardwareRegistryEntry e;
         e.device_id = "ublox_rtk_gnss";
