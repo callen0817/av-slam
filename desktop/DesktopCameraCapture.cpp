@@ -163,7 +163,29 @@ void DesktopCameraCapture::captureLoop() {
     if (SUCCEEDED(MFCreateAttributes(&attrs, 1))) {
         attrs->SetGUID(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID);
         if (SUCCEEDED(MFEnumDeviceSources(attrs, &devices, &count)) && count > 0) {
+            // Score every enumerated UVC camera so Orbbec Gemini 336L RGB / Color always beats Depth/IR/Front
+            auto scoreCameraName = [&](const std::string& rawName) -> int {
+                std::string nl = toLowerCopy(rawName);
+                int score = 0;
+                // Strictly penalize Depth / IR / Infrared endpoints (Orbbec exposes separate Depth/IR/RGB UVC devices)
+                if (nl.find("depth") != std::string::npos ||
+                    nl.find("infrared") != std::string::npos ||
+                    nl.find(" ir") != std::string::npos ||
+                    nl.find("ir ") != std::string::npos ||
+                    nl.find("_ir") != std::string::npos) {
+                    score -= 1000;
+                }
+                if (!hint.empty() && nl.find(hint) != std::string::npos) score += 100;
+                if (nl.find("orbbec") != std::string::npos) score += 90;
+                if (nl.find("gemini") != std::string::npos) score += 90;
+                if (nl.find("336") != std::string::npos) score += 90;
+                if (nl.find("rgb") != std::string::npos || nl.find("color") != std::string::npos) score += 60;
+                if (nl.find("surface") != std::string::npos || nl.find("integrated") != std::string::npos) score -= 20;
+                return score;
+            };
+
             UINT32 chosen = 0;
+            int best_score = -100000;
             std::string chosen_name;
             for (UINT32 i = 0; i < count; ++i) {
                 wchar_t* fname = nullptr;
@@ -173,15 +195,11 @@ void DesktopCameraCapture::captureLoop() {
                     n = wideToUtf8(fname);
                     CoTaskMemFree(fname);
                 }
-                std::string nl = toLowerCopy(n);
-                if (i == 0) chosen_name = n;
-                if ((!hint.empty() && nl.find(hint) != std::string::npos) ||
-                    nl.find("orbbec") != std::string::npos ||
-                    nl.find("gemini") != std::string::npos ||
-                    nl.find("336") != std::string::npos) {
+                int sc = scoreCameraName(n);
+                if (sc > best_score) {
+                    best_score = sc;
                     chosen = i;
                     chosen_name = n;
-                    break;
                 }
             }
             if (SUCCEEDED(devices[chosen]->ActivateObject(IID_PPV_ARGS(&source)))) {
@@ -189,12 +207,17 @@ void DesktopCameraCapture::captureLoop() {
                 MFCreateAttributes(&rAttrs, 1);
                 if (rAttrs) rAttrs->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, TRUE);
                 if (SUCCEEDED(MFCreateSourceReaderFromMediaSource(source, rAttrs, &reader))) {
-                    IMFMediaType* outType = nullptr;
-                    if (SUCCEEDED(MFCreateMediaType(&outType))) {
-                        outType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-                        outType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
-                        reader->SetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, outType);
-                        outType->Release();
+                    // Request RGB32 first; if UVC driver rejects it, fall back cleanly to YUY2 or NV12
+                    const GUID preferredSubtypes[3] = { MFVideoFormat_RGB32, MFVideoFormat_YUY2, MFVideoFormat_NV12 };
+                    for (const GUID& sub : preferredSubtypes) {
+                        IMFMediaType* outType = nullptr;
+                        if (SUCCEEDED(MFCreateMediaType(&outType))) {
+                            outType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+                            outType->SetGUID(MF_MT_SUBTYPE, sub);
+                            HRESULT setHr = reader->SetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, outType);
+                            outType->Release();
+                            if (SUCCEEDED(setHr)) break;
+                        }
                     }
                     std::lock_guard<std::mutex> lock(mutex_);
                     active_camera_name_ = chosen_name;
@@ -219,10 +242,21 @@ void DesktopCameraCapture::captureLoop() {
     }
 
     UINT32 frameW = 640, frameH = 480;
+    GUID actualSubtype = MFVideoFormat_RGB32;
     IMFMediaType* curType = nullptr;
     if (SUCCEEDED(reader->GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, &curType))) {
         MFGetAttributeSize(curType, MF_MT_FRAME_SIZE, &frameW, &frameH);
+        curType->GetGUID(MF_MT_SUBTYPE, &actualSubtype);
         curType->Release();
+    }
+    const bool isRgb32 = (actualSubtype == MFVideoFormat_RGB32 || actualSubtype == MFVideoFormat_ARGB32);
+    const bool isYuy2  = (actualSubtype == MFVideoFormat_YUY2);
+    const bool isNv12  = (actualSubtype == MFVideoFormat_NV12);
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const char* fmtTag = isRgb32 ? "RGB32" : (isYuy2 ? "YUY2" : (isNv12 ? "NV12" : "RAW"));
+        status_summary_ = std::string("LIVE [") + fmtTag + " " + std::to_string(frameW) + "x" +
+                          std::to_string(frameH) + "]: " + active_camera_name_;
     }
 
     double fps_window_start = steadyNowSec();
@@ -243,7 +277,10 @@ void DesktopCameraCapture::captureLoop() {
         if (SUCCEEDED(sample->ConvertToContiguousBuffer(&buf))) {
             BYTE* raw = nullptr;
             DWORD maxLen = 0, curLen = 0;
-            if (SUCCEEDED(buf->Lock(&raw, &maxLen, &curLen)) && raw && curLen >= frameW * frameH * 4) {
+            const size_t minBytes = isRgb32 ? (static_cast<size_t>(frameW) * frameH * 4)
+                                  : (isYuy2 ? (static_cast<size_t>(frameW) * frameH * 2)
+                                            : (static_cast<size_t>(frameW) * frameH * 3 / 2));
+            if (SUCCEEDED(buf->Lock(&raw, &maxLen, &curLen)) && raw && curLen >= minBytes) {
                 int scale = (frameW >= 1280) ? 4 : ((frameW >= 640) ? 2 : 1);
                 int dstW = static_cast<int>(frameW) / scale;
                 int dstH = static_cast<int>(frameH) / scale;
@@ -263,17 +300,60 @@ void DesktopCameraCapture::captureLoop() {
                 rf.rgb_bytes.resize(static_cast<size_t>(dstW * dstH * 3));
                 rf.gray_bytes.resize(static_cast<size_t>(dstW * dstH));
 
-                const size_t stride = static_cast<size_t>(frameW) * 4;
-                for (int y = 0; y < dstH; ++y) {
-                    const BYTE* row = raw + static_cast<size_t>(y * scale) * stride;
-                    for (int x = 0; x < dstW; ++x) {
-                        const BYTE* px = row + static_cast<size_t>(x * scale) * 4;
-                        uint8_t b = px[0], g = px[1], r = px[2];
-                        size_t idx = static_cast<size_t>(y * dstW + x);
-                        rf.rgb_bytes[idx * 3 + 0] = r;
-                        rf.rgb_bytes[idx * 3 + 1] = g;
-                        rf.rgb_bytes[idx * 3 + 2] = b;
-                        rf.gray_bytes[idx] = static_cast<uint8_t>((77 * r + 150 * g + 29 * b) >> 8);
+                if (isRgb32) {
+                    const size_t stride = static_cast<size_t>(frameW) * 4;
+                    for (int y = 0; y < dstH; ++y) {
+                        const BYTE* row = raw + static_cast<size_t>(y * scale) * stride;
+                        for (int x = 0; x < dstW; ++x) {
+                            const BYTE* px = row + static_cast<size_t>(x * scale) * 4;
+                            uint8_t b = px[0], g = px[1], r = px[2];
+                            size_t idx = static_cast<size_t>(y * dstW + x);
+                            rf.rgb_bytes[idx * 3 + 0] = r;
+                            rf.rgb_bytes[idx * 3 + 1] = g;
+                            rf.rgb_bytes[idx * 3 + 2] = b;
+                            rf.gray_bytes[idx] = static_cast<uint8_t>((77 * r + 150 * g + 29 * b) >> 8);
+                        }
+                    }
+                } else if (isYuy2) {
+                    const size_t stride = static_cast<size_t>(frameW) * 2;
+                    for (int y = 0; y < dstH; ++y) {
+                        const BYTE* row = raw + static_cast<size_t>(y * scale) * stride;
+                        for (int x = 0; x < dstW; ++x) {
+                            int sx = (x * scale) & ~1;  // align to 4-byte Y0 U Y1 V macropixel
+                            const BYTE* p = row + static_cast<size_t>(sx) * 2;
+                            int y0 = p[0], u = p[1] - 128, v = p[3] - 128;
+                            int r = std::clamp(static_cast<int>(y0 + 1.402 * v), 0, 255);
+                            int g = std::clamp(static_cast<int>(y0 - 0.344136 * u - 0.714136 * v), 0, 255);
+                            int bl = std::clamp(static_cast<int>(y0 + 1.772 * u), 0, 255);
+                            size_t idx = static_cast<size_t>(y * dstW + x);
+                            rf.gray_bytes[idx] = static_cast<uint8_t>(y0);
+                            rf.rgb_bytes[idx * 3 + 0] = static_cast<uint8_t>(r);
+                            rf.rgb_bytes[idx * 3 + 1] = static_cast<uint8_t>(g);
+                            rf.rgb_bytes[idx * 3 + 2] = static_cast<uint8_t>(bl);
+                        }
+                    }
+                } else {
+                    // NV12 bi-planar fallback
+                    const BYTE* yPlane = raw;
+                    const BYTE* uvPlane = raw + static_cast<size_t>(frameW) * frameH;
+                    for (int y = 0; y < dstH; ++y) {
+                        int sy = y * scale;
+                        const BYTE* yRow = yPlane + static_cast<size_t>(sy) * frameW;
+                        const BYTE* uvRow = uvPlane + static_cast<size_t>(sy / 2) * frameW;
+                        for (int x = 0; x < dstW; ++x) {
+                            int sx = x * scale;
+                            int y0 = yRow[sx];
+                            int u = uvRow[(sx & ~1) + 0] - 128;
+                            int v = uvRow[(sx & ~1) + 1] - 128;
+                            int r = std::clamp(static_cast<int>(y0 + 1.402 * v), 0, 255);
+                            int g = std::clamp(static_cast<int>(y0 - 0.344136 * u - 0.714136 * v), 0, 255);
+                            int bl = std::clamp(static_cast<int>(y0 + 1.772 * u), 0, 255);
+                            size_t idx = static_cast<size_t>(y * dstW + x);
+                            rf.gray_bytes[idx] = static_cast<uint8_t>(y0);
+                            rf.rgb_bytes[idx * 3 + 0] = static_cast<uint8_t>(r);
+                            rf.rgb_bytes[idx * 3 + 1] = static_cast<uint8_t>(g);
+                            rf.rgb_bytes[idx * 3 + 2] = static_cast<uint8_t>(bl);
+                        }
                     }
                 }
                 buf->Unlock();
@@ -316,6 +396,7 @@ void DesktopCameraCapture::captureLoop() {
         fallback_intr = fallback_intrinsics_;
     }
 
+    int best_v4l2_score = -100000;
     for (int i = 0; i < 12; ++i) {
         std::string dev = "/dev/video" + std::to_string(i);
         int fd = ::open(dev.c_str(), O_RDWR | O_NONBLOCK);
@@ -324,18 +405,18 @@ void DesktopCameraCapture::captureLoop() {
         if (::ioctl(fd, VIDIOC_QUERYCAP, &cap) == 0 && (cap.capabilities & V4L2_CAP_VIDEO_CAPTURE)) {
             std::string card(reinterpret_cast<const char*>(cap.card));
             std::string cl = toLowerCopy(card);
-            if (chosen_dev.empty()) {
-                chosen_dev = dev;
-                chosen_name = card;
+            int sc = 0;
+            if (cl.find("depth") != std::string::npos || cl.find("infrared") != std::string::npos ||
+                cl.find(" ir") != std::string::npos || cl.find("_ir") != std::string::npos) {
+                sc -= 1000;
             }
-            if ((!hint.empty() && cl.find(hint) != std::string::npos) ||
-                cl.find("orbbec") != std::string::npos ||
-                cl.find("gemini") != std::string::npos ||
-                cl.find("336") != std::string::npos) {
+            if (!hint.empty() && cl.find(hint) != std::string::npos) sc += 100;
+            if (cl.find("orbbec") != std::string::npos || cl.find("gemini") != std::string::npos || cl.find("336") != std::string::npos) sc += 90;
+            if (cl.find("rgb") != std::string::npos || cl.find("color") != std::string::npos) sc += 60;
+            if (sc > best_v4l2_score) {
+                best_v4l2_score = sc;
                 chosen_dev = dev;
                 chosen_name = card;
-                ::close(fd);
-                break;
             }
         }
         ::close(fd);
