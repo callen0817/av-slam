@@ -14,12 +14,16 @@
 #include "avscan/quality/QualityMonitor.hpp"
 #include "avscan/sensors/AiryDiscovery.hpp"
 #include "avscan/sensors/AiryUdpReceiver.hpp"
+#include "avscan/sensors/GnssRtkReceiver.hpp"
 #include "avscan/sensors/IDepthProvider.hpp"
+#include "avscan/sensors/UniversalRigPresets.hpp"
 #include "avscan/slam/AvSlamEngine.hpp"
+#include "avscan/slam/SensorAgnosticSlamEngine.hpp"
 #include "avscan/storage/ProjectStore.hpp"
 #include "avscan/sync/TimeSynchronizer.hpp"
 #include "avscan/terrestrial/TerrestrialStationManager.hpp"
 #include <atomic>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -74,10 +78,15 @@ public:
     std::string activeScanFloorLevel() const { return active_scan_floor_level_; }
     std::string activeScanDir() const { return active_scan_dir_; }
 
-    // Rig & Hardware Profiles
+    // Rig & Hardware Profiles (Universal Sensor-Agnostic Catalog)
     bool setActiveDeviceProfile(const std::string& profile_id);
     std::string activeDeviceProfileDisplayName() const;
     std::string activeDeviceProfileId() const;
+    void setUniversalSensorProfile(const std::string& universal_profile_id);
+    std::string activeUniversalProfileId() const { return active_universal_profile_id_; }
+    std::string activeUniversalProfileName() const { return active_universal_profile_name_; }
+    slam::AgnosticSlamStatus currentAgnosticStatus() const;
+    bool injectNmeaGnssSentence(const std::string& nmea_gga);
 
     // Airy Ethernet Diagnostics
     sensors::AiryNetworkConfig currentNetworkConfig() const;
@@ -143,7 +152,8 @@ private:
     DesktopCameraCapture camera_;
 
     sync::TimeSynchronizer synchronizer_;
-    slam::AvSlamEngine slam_engine_;
+    slam::SensorAgnosticSlamEngine agnostic_engine_;
+    sensors::GnssRtkProcessor gnss_processor_;
     backend::ScanContextDatabase sc_db_;
     backend::GicpVerifier gicp_verifier_;
     backend::PoseGraphOptimizer pose_graph_;
@@ -171,6 +181,14 @@ private:
     std::string active_scan_name_;
     std::string active_scan_floor_level_{"Level 01"};
     std::string active_scan_dir_;
+    std::string active_universal_profile_id_{"scanar_v4_airy_336l"};
+    std::string active_universal_profile_name_{"ScanAR V4 (RoboSense Airy + Orbbec Gemini 336L)"};
+
+    std::mutex mono_rgb_mutex_;
+    std::deque<core::RgbFrame> standalone_rgb_queue_;
+    std::optional<sensors::GnssRtkMeasurement> pending_gnss_fix_;
+    double last_lidar_arrival_sec_{0.0};
+    uint64_t universal_seq_id_{0};
 
     DesktopAcquisitionMode acquisition_mode_{DesktopAcquisitionMode::MOBILE_SLAM};
     std::atomic<bool> is_scanning_{false};

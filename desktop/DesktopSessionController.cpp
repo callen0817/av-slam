@@ -155,6 +155,7 @@ void DesktopSessionController::setupCallbacks() {
     udp_receiver_->setCallbacks(
         [this](const core::LidarFrame& frame) {
             double now = steadyNowSec();
+            last_lidar_arrival_sec_ = now;
             if (!is_terrestrial_active_.load()) {
                 synchronizer_.pushLidarFrame(frame, now);
             } else if (station_manager_) {
@@ -178,7 +179,7 @@ void DesktopSessionController::setupCallbacks() {
             const double dRotDeg =
                 (factory_calib_.T_imu_lidar.so3.inverse() * calib.T_imu_lidar.so3).log().norm() * math::kRadToDeg;
             factory_calib_ = calib;
-            slam_engine_.setFactoryCalibration(calib);
+            agnostic_engine_.coreEngine().setFactoryCalibration(calib);
             if (dRotDeg > 5.0 && is_scanning_.load() && pose_graph_.getSubmaps().size() <= 5) {
                 pose_graph_.clear();
                 sc_db_.clear();
@@ -195,6 +196,9 @@ void DesktopSessionController::setupCallbacks() {
     camera_.setFrameCallback([this](const core::RgbFrame& rgb) {
         if (!is_terrestrial_active_.load()) {
             synchronizer_.pushRgbFrame(rgb);
+            std::lock_guard<std::mutex> lk(mono_rgb_mutex_);
+            standalone_rgb_queue_.push_back(rgb);
+            while (standalone_rgb_queue_.size() > 4) standalone_rgb_queue_.pop_front();
         }
     });
 }
@@ -294,7 +298,8 @@ bool DesktopSessionController::selectScan(const std::string& scan_id) {
     active_scan_dir_ = sdir.string();
 
     std::lock_guard<std::mutex> lock(state_mutex_);
-    slam_engine_.reset();
+    agnostic_engine_.reset();
+    gnss_processor_.reset();
     synchronizer_.reset();
     pose_graph_.clear();
     sc_db_.clear();
@@ -315,8 +320,33 @@ bool DesktopSessionController::setActiveDeviceProfile(const std::string& profile
     auto ext = core::DeviceProfileRegistry::instance().activeExtrinsics();
     std::lock_guard<std::mutex> lock(state_mutex_);
     calib_profile_ = ext;
-    slam_engine_.setExtrinsicCalibration(ext);
+    agnostic_engine_.setExtrinsicCalibration(ext);
     synchronizer_.setCalibratedCameraTimeOffset(ext.camera_time_offset_sec);
+    return true;
+}
+
+void DesktopSessionController::setUniversalSensorProfile(const std::string& universal_profile_id) {
+    for (const auto& up : sensors::UniversalRigCatalog::allProfiles()) {
+        if (up.profile_id == universal_profile_id) {
+            active_universal_profile_id_ = up.profile_id;
+            active_universal_profile_name_ = up.display_name;
+            std::lock_guard<std::mutex> lock(state_mutex_);
+            agnostic_engine_.setSensorRigConfig(up.rig_config);
+            return;
+        }
+    }
+}
+
+slam::AgnosticSlamStatus DesktopSessionController::currentAgnosticStatus() const {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    return agnostic_engine_.getAgnosticStatus();
+}
+
+bool DesktopSessionController::injectNmeaGnssSentence(const std::string& nmea_gga) {
+    sensors::GnssRtkMeasurement fix;
+    if (!gnss_processor_.parseNmeaGga(nmea_gga, steadyNowSec(), fix)) return false;
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    pending_gnss_fix_ = fix;
     return true;
 }
 
@@ -341,7 +371,8 @@ bool DesktopSessionController::startScanning() {
     if (is_scanning_.load()) return true;
     {
         std::lock_guard<std::mutex> lock(state_mutex_);
-        slam_engine_.reset();
+        agnostic_engine_.reset();
+        gnss_processor_.reset();
         synchronizer_.reset();
         pose_graph_.clear();
         sc_db_.clear();
@@ -354,12 +385,17 @@ bool DesktopSessionController::startScanning() {
         unclosed_dist_m_ = 0.0;
         last_loop_kf_id_ = 0;
         has_prev_odom_pos_ = false;
+        universal_seq_id_ = 0;
         if (factory_calib_.valid) {
-            slam_engine_.setFactoryCalibration(factory_calib_);
+            agnostic_engine_.coreEngine().setFactoryCalibration(factory_calib_);
         }
-        slam_engine_.setExtrinsicCalibration(calib_profile_);
-        slam_engine_.setVisualFusionEnabled(false);
+        agnostic_engine_.setExtrinsicCalibration(calib_profile_);
+        agnostic_engine_.coreEngine().setVisualFusionEnabled(false);
         synchronizer_.setCalibratedCameraTimeOffset(calib_profile_.camera_time_offset_sec);
+    }
+    {
+        std::lock_guard<std::mutex> lk(mono_rgb_mutex_);
+        standalone_rgb_queue_.clear();
     }
 
     fs::path raw_path = fs::path(active_scan_dir_) / "raw_capture.avraw";
@@ -389,7 +425,29 @@ void DesktopSessionController::slamWorkerLoop() {
             continue;
         }
         sync::SyncBundle bundle;
-        if (!synchronizer_.popSyncBundle(bundle)) {
+        slam::UniversalSensorBundle u_bundle;
+        bool have_bundle = false;
+
+        if (synchronizer_.popSyncBundle(bundle)) {
+            u_bundle.sequence_id = ++universal_seq_id_;
+            u_bundle.timestamp_sec = bundle.lidar_frame.timestamp_end_sec;
+            u_bundle.lidar_frame = bundle.lidar_frame;
+            u_bundle.imu_measurements = bundle.imu_measurements;
+            u_bundle.rgb_frame = bundle.rgb_frame;
+            have_bundle = true;
+        } else if ((steadyNowSec() - last_lidar_arrival_sec_) > 0.25) {
+            // Sensor-agnostic fallback: run Monocular-only (or Depth-only) when no LiDAR is attached!
+            std::lock_guard<std::mutex> lk(mono_rgb_mutex_);
+            if (!standalone_rgb_queue_.empty()) {
+                u_bundle.sequence_id = ++universal_seq_id_;
+                u_bundle.rgb_frame = standalone_rgb_queue_.front();
+                u_bundle.timestamp_sec = u_bundle.rgb_frame->timestamp_sec;
+                standalone_rgb_queue_.pop_front();
+                have_bundle = true;
+            }
+        }
+
+        if (!have_bundle) {
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
             continue;
         }
@@ -399,9 +457,13 @@ void DesktopSessionController::slamWorkerLoop() {
         slam::EstimatorMetrics metrics;
 
         std::lock_guard<std::mutex> lock(state_mutex_);
-        if (!slam_engine_.processBundle(bundle, deskewed_body, world_frame, metrics)) continue;
+        if (pending_gnss_fix_.has_value()) {
+            u_bundle.gnss_fix = pending_gnss_fix_;
+            pending_gnss_fix_.reset();
+        }
+        if (!agnostic_engine_.processUniversalBundle(u_bundle, deskewed_body, world_frame, metrics)) continue;
 
-        auto state = slam_engine_.getCurrentState();
+        auto state = agnostic_engine_.getCurrentState();
         if (has_prev_odom_pos_) {
             double step_m = (state.T_world_body.t - prev_odom_pos_).norm();
             if (step_m < 2.0) {
@@ -514,7 +576,7 @@ bool DesktopSessionController::startTerrestrialStation(double step_deg, bool is_
     if (is_flash_during_slam && is_scanning_.load()) {
         is_slam_paused_for_station_.store(true);
         std::lock_guard<std::mutex> lock(state_mutex_);
-        flash_station_anchor_pose_ = slam_engine_.getCurrentState().T_world_body;
+        flash_station_anchor_pose_ = agnostic_engine_.getCurrentState().T_world_body;
         acquisition_mode_ = DesktopAcquisitionMode::HYBRID_FLASH_STATION;
     } else {
         if (is_scanning_.load()) stopScanning();
@@ -617,7 +679,7 @@ bool DesktopSessionController::exportSpatialBundle(const std::string& output_dir
         st.point_count = submaps[i].local_points.size();
         stations.push_back(st);
     }
-    auto traj = slam_engine_.getTrajectory();
+    auto traj = agnostic_engine_.getTrajectory();
     return export_bundle::AvSpatialBundleExporter::exportWalkthroughBundle(
         output_dir, cfg, cached_global_cloud_, traj, latest_floor_plan_, stations);
 }
@@ -648,7 +710,7 @@ void DesktopSessionController::cslamBeaconLoop() {
         uint32_t kfs = 0;
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
-            pose = slam_engine_.getCurrentState().T_world_body;
+            pose = agnostic_engine_.getCurrentState().T_world_body;
             kfs = static_cast<uint32_t>(pose_graph_.getSubmaps().size());
         }
         auto beacon = cslam_engine_->serializeBeacon(pose, kfs);
@@ -698,7 +760,7 @@ std::vector<core::LidarPointXYZIRT> DesktopSessionController::latestGlobalPointC
 
 std::vector<core::SlamState> DesktopSessionController::currentTrajectory() const {
     std::lock_guard<std::mutex> lock(state_mutex_);
-    auto traj = slam_engine_.getTrajectory();
+    auto traj = agnostic_engine_.getTrajectory();
     if (is_cslam_enabled_.load() && cslam_engine_) {
         auto pt = cslam_engine_->getAlignedPeerTrajectories();
         traj.insert(traj.end(), pt.begin(), pt.end());
@@ -718,7 +780,7 @@ quality::FloorPlanGrid2D DesktopSessionController::latestFloorPlan() const {
 
 slam::AvSlamRuntimeStats DesktopSessionController::currentAvSlamStats() const {
     std::lock_guard<std::mutex> lock(state_mutex_);
-    return slam_engine_.getRuntimeStats();
+    return agnostic_engine_.coreEngine().getRuntimeStats();
 }
 
 core::ExtrinsicCalibrationProfile DesktopSessionController::currentCalibrationProfile() const {

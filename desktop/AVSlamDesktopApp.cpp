@@ -149,7 +149,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    GLFWwindow* window = glfwCreateWindow(1440, 900, "AV SLAM — Proprietary Multi-Sensor Desktop (Windows / Linux)", nullptr, nullptr);
+    GLFWwindow* window = glfwCreateWindow(1440, 900, "AV SLAM AGNOSTIC (Phase 3) — Universal Multi-Sensor SLAM", nullptr, nullptr);
     if (!window) {
         glfwTerminate();
         return 1;
@@ -235,6 +235,7 @@ int main(int argc, char** argv) {
         auto qual = controller.latestQualityReport();
         auto slam_stats = controller.currentAvSlamStats();
         auto cslam_stats = controller.cslamStats();
+        auto agnostic_status = controller.currentAgnosticStatus();
 
         // Render 3D OpenGL Viewport
         int fb_w = 1280, fb_h = 720;
@@ -323,6 +324,18 @@ int main(int argc, char** argv) {
             }
             if (ImGui::Button("Calibrate")) show_calib_window = !show_calib_window;
 
+            if (ImGui::BeginMenu("Sensor Profile")) {
+                auto uprofiles = avscan::sensors::UniversalRigCatalog::allProfiles();
+                std::string cur_uid = controller.activeUniversalProfileId();
+                for (const auto& up : uprofiles) {
+                    bool sel = (up.profile_id == cur_uid);
+                    if (ImGui::MenuItem(up.display_name.c_str(), nullptr, sel)) {
+                        controller.setUniversalSensorProfile(up.profile_id);
+                    }
+                }
+                ImGui::EndMenu();
+            }
+
             if (ImGui::BeginMenu("Rig Profile")) {
                 const auto& profiles = avscan::core::DeviceProfileRegistry::instance().allProfiles();
                 std::string cur_id = controller.activeDeviceProfileId();
@@ -350,13 +363,16 @@ int main(int argc, char** argv) {
 
         // Top-Left HUD Status & Metrics Card
         ImGui::SetNextWindowPos(ImVec2(14, 34), ImGuiCond_Always);
-        ImGui::SetNextWindowSize(ImVec2(430, 150), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(460, 172), ImGuiCond_Always);
         ImGui::Begin("##HudStatus", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove);
         ImGui::TextColored(ImVec4(0.90f, 0.79f, 0.51f, 1.0f), "%s  |  %s (%s)",
                            controller.activeProjectName().c_str(),
                            controller.activeScanName().c_str(),
                            controller.activeScanFloorLevel().c_str());
-        ImGui::Text("RIG: %s", controller.activeDeviceProfileDisplayName().c_str());
+        ImGui::TextColored(ImVec4(0.22f, 0.74f, 0.97f, 1.0f), "AGNOSTIC MODE: %s  |  RTK: %s",
+                           agnostic_status.mode_summary.c_str(),
+                           agnostic_status.gnss_rtk_locked ? "LOCKED" : "STANDBY");
+        ImGui::Text("PROFILE: %s", controller.activeUniversalProfileName().c_str());
         ImGui::Text("PTS: %zu  |  LOOPS: %zu  |  LOSS: %.2f%%  |  %.1f ms/sweep",
                     cloud.size(), controller.loopClosureCount(),
                     pkt.msopPacketLossRatio() * 100.0, slam_stats.avg_frame_ms);
