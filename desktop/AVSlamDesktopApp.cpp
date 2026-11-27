@@ -135,9 +135,13 @@ int main(int argc, char** argv) {
     if (headless_smoke_test) {
         auto diag = controller.runAiryDiagnostics();
         auto profiles = avscan::core::DeviceProfileRegistry::instance().allProfiles();
-        std::printf("[PASS] AV-SLAM Desktop Smoke Test OK | ActiveRig=%s | Profiles=%zu | Project=%s/%s | Adapter=%s\n",
+        auto imus = controller.availableImuSources();
+        auto cams = controller.availableCameraNames();
+        std::printf("[PASS] AV-SLAM Desktop Smoke Test OK | ActiveRig=%s | Profiles=%zu | Cams=%zu | IMUs=%zu | Project=%s/%s | Adapter=%s\n",
                     controller.activeDeviceProfileDisplayName().c_str(),
                     profiles.size(),
+                    cams.size(),
+                    imus.size(),
                     controller.activeProjectName().c_str(),
                     controller.activeScanName().c_str(),
                     diag.adapter_detected ? "ONLINE" : "OFFLINE");
@@ -336,19 +340,71 @@ int main(int argc, char** argv) {
                 ImGui::EndMenu();
             }
 
-            if (ImGui::BeginMenu("Camera")) {
-                std::string cur_cam = controller.selectedCameraOverride();
-                if (ImGui::MenuItem("Auto-Select (Prefer Orbbec 336L RGB)", nullptr, cur_cam.empty())) {
-                    controller.selectCameraOverride("");
-                }
-                ImGui::Separator();
-                for (const auto& cname : controller.availableCameraNames()) {
-                    bool sel = (cname == cur_cam);
-                    if (ImGui::MenuItem(cname.c_str(), nullptr, sel)) {
-                        controller.selectCameraOverride(cname);
+            {
+                auto tog = controller.sensorToggles();
+                if (ImGui::BeginMenu("LiDAR")) {
+                    if (ImGui::MenuItem("Auto (RoboSense Airy UDP)", nullptr, tog.lidar_mode == avscan::desktop::SensorSelectionMode::AUTO)) {
+                        controller.setLidarSelection(avscan::desktop::SensorSelectionMode::AUTO);
                     }
+                    if (ImGui::MenuItem("None (Off)", nullptr, tog.lidar_mode == avscan::desktop::SensorSelectionMode::DISABLED_NONE)) {
+                        controller.setLidarSelection(avscan::desktop::SensorSelectionMode::DISABLED_NONE);
+                    }
+                    ImGui::EndMenu();
                 }
-                ImGui::EndMenu();
+
+                if (ImGui::BeginMenu("Camera")) {
+                    if (ImGui::MenuItem("Auto-Select (Prefer Orbbec 336L RGB)", nullptr, tog.rgb_mode == avscan::desktop::SensorSelectionMode::AUTO)) {
+                        controller.setRgbSelection(avscan::desktop::SensorSelectionMode::AUTO);
+                    }
+                    if (ImGui::MenuItem("None (Off)", nullptr, tog.rgb_mode == avscan::desktop::SensorSelectionMode::DISABLED_NONE)) {
+                        controller.setRgbSelection(avscan::desktop::SensorSelectionMode::DISABLED_NONE);
+                    }
+                    ImGui::Separator();
+                    for (const auto& cname : controller.availableCameraNames()) {
+                        bool sel = (tog.rgb_mode == avscan::desktop::SensorSelectionMode::ENABLED_SPECIFIC && tog.rgb_device_name == cname);
+                        if (ImGui::MenuItem(cname.c_str(), nullptr, sel)) {
+                            controller.setRgbSelection(avscan::desktop::SensorSelectionMode::ENABLED_SPECIFIC, cname);
+                        }
+                    }
+                    ImGui::EndMenu();
+                }
+
+                if (ImGui::BeginMenu("Depth")) {
+                    if (ImGui::MenuItem("Auto (Orbbec Gemini 336L Depth)", nullptr, tog.depth_mode == avscan::desktop::SensorSelectionMode::AUTO)) {
+                        controller.setDepthSelection(avscan::desktop::SensorSelectionMode::AUTO);
+                    }
+                    if (ImGui::MenuItem("None (Off)", nullptr, tog.depth_mode == avscan::desktop::SensorSelectionMode::DISABLED_NONE)) {
+                        controller.setDepthSelection(avscan::desktop::SensorSelectionMode::DISABLED_NONE);
+                    }
+                    ImGui::EndMenu();
+                }
+
+                if (ImGui::BeginMenu("IMU")) {
+                    if (ImGui::MenuItem("Auto (Best: Airy > Host/USB IMU)", nullptr, tog.imu_mode == avscan::desktop::SensorSelectionMode::AUTO)) {
+                        controller.setImuSelection(avscan::desktop::SensorSelectionMode::AUTO);
+                    }
+                    if (ImGui::MenuItem("None (Off)", nullptr, tog.imu_mode == avscan::desktop::SensorSelectionMode::DISABLED_NONE)) {
+                        controller.setImuSelection(avscan::desktop::SensorSelectionMode::DISABLED_NONE);
+                    }
+                    ImGui::Separator();
+                    for (const auto& imu : controller.availableImuSources()) {
+                        bool sel = (tog.imu_mode == avscan::desktop::SensorSelectionMode::ENABLED_SPECIFIC && tog.imu_source_id == imu.id);
+                        if (ImGui::MenuItem(imu.display_name.c_str(), nullptr, sel)) {
+                            controller.setImuSelection(avscan::desktop::SensorSelectionMode::ENABLED_SPECIFIC, imu.id);
+                        }
+                    }
+                    ImGui::EndMenu();
+                }
+
+                if (ImGui::BeginMenu("GPS/RTK")) {
+                    if (ImGui::MenuItem("Auto (NMEA / RTK)", nullptr, tog.gnss_mode == avscan::desktop::SensorSelectionMode::AUTO)) {
+                        controller.setGnssSelection(avscan::desktop::SensorSelectionMode::AUTO);
+                    }
+                    if (ImGui::MenuItem("None (Off)", nullptr, tog.gnss_mode == avscan::desktop::SensorSelectionMode::DISABLED_NONE)) {
+                        controller.setGnssSelection(avscan::desktop::SensorSelectionMode::DISABLED_NONE);
+                    }
+                    ImGui::EndMenu();
+                }
             }
 
             if (ImGui::BeginMenu("Rig Profile")) {
@@ -378,7 +434,7 @@ int main(int argc, char** argv) {
 
         // Top-Left HUD Status & Metrics Card
         ImGui::SetNextWindowPos(ImVec2(14, 34), ImGuiCond_Always);
-        ImGui::SetNextWindowSize(ImVec2(460, 172), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(480, 192), ImGuiCond_Always);
         ImGui::Begin("##HudStatus", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove);
         ImGui::TextColored(ImVec4(0.90f, 0.79f, 0.51f, 1.0f), "%s  |  %s (%s)",
                            controller.activeProjectName().c_str(),
@@ -393,6 +449,7 @@ int main(int argc, char** argv) {
                     pkt.msopPacketLossRatio() * 100.0, slam_stats.avg_frame_ms);
         ImGui::Text("CAM: %s (%.1f FPS)", controller.cameraStatusSummary().c_str(), controller.cameraMeasuredFps());
         ImGui::Text("DEPTH: %s", controller.depthStatusSummary().c_str());
+        ImGui::Text("IMU: %s", controller.imuStatusSummary().c_str());
         ImGui::TextColored(ImVec4(0.29f, 0.87f, 0.50f, 1.0f), "QUALITY: %.0f%%  |  RMSE: %.3f m  |  DRIFT RISK: %.2f m",
                            qual.overall_quality_score * 100.0, qual.registration_rmse_m, qual.estimated_drift_risk_m);
         ImGui::End();

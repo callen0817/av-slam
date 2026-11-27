@@ -96,12 +96,19 @@ private:
     core::ExtrinsicCalibrationProfile cam_extrinsics_{};
     AgnosticSlamStatus agnostic_status_{};
 
-    // Monocular-only fallback state (when neither LiDAR nor DepthFrame nor IDepthProvider is available)
+    // Monocular-only & optical-flow helper state
     bool has_prev_mono_frame_{false};
     core::RgbFrame prev_mono_frame_{};
     core::SlamState mono_state_{};
+    math::SE3d last_mono_kf_pose_{math::SE3d::Identity()};
+    bool has_mono_kf_{false};
     std::vector<core::SlamState> mono_trajectory_;
     bool using_mono_fallback_{false};
+
+    // Optical-flow rotation prior for IMU-less Depth-only mode
+    bool has_prev_depth_rgb_{false};
+    core::RgbFrame prev_depth_rgb_{};
+    double last_depth_rgb_ts_{0.0};
 
     // Geodetic ENU offset alignment
     bool has_gnss_anchor_{false};

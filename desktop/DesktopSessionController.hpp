@@ -2,6 +2,7 @@
 
 #include "DesktopCameraCapture.hpp"
 #include "DesktopDepthCapture.hpp"
+#include "DesktopImuCapture.hpp"
 #include "avscan/backend/GicpVerifier.hpp"
 #include "avscan/backend/PoseGraphOptimizer.hpp"
 #include "avscan/backend/ScanContext.hpp"
@@ -39,6 +40,22 @@ enum class DesktopAcquisitionMode {
     MOBILE_SLAM = 0,
     TERRESTRIAL_STATION = 1,
     HYBRID_FLASH_STATION = 2
+};
+
+enum class SensorSelectionMode {
+    AUTO = 0,
+    ENABLED_SPECIFIC = 1,
+    DISABLED_NONE = 2
+};
+
+struct DesktopSensorToggles {
+    SensorSelectionMode lidar_mode{SensorSelectionMode::AUTO};
+    SensorSelectionMode rgb_mode{SensorSelectionMode::AUTO};
+    std::string rgb_device_name;
+    SensorSelectionMode depth_mode{SensorSelectionMode::AUTO};
+    SensorSelectionMode imu_mode{SensorSelectionMode::AUTO};
+    std::string imu_source_id;
+    SensorSelectionMode gnss_mode{SensorSelectionMode::AUTO};
 };
 
 struct DesktopProjectSummary {
@@ -141,9 +158,19 @@ public:
     std::string cameraStatusSummary() const { return camera_.statusSummary(); }
     double cameraMeasuredFps() const { return camera_.measuredFps(); }
     std::string depthStatusSummary() const { return depth_capture_.statusSummary(); }
+    std::string imuStatusSummary() const;
     std::vector<std::string> availableCameraNames() const { return camera_.enumerateCameraNames(); }
-    void selectCameraOverride(const std::string& exact_name) { camera_.setExactCameraNameOverride(exact_name); }
+    std::vector<DetectedImuInfo> availableImuSources() const;
+    void selectCameraOverride(const std::string& exact_name);
     std::string selectedCameraOverride() const { return camera_.exactCameraNameOverride(); }
+
+    // Per-Sensor Toggles (Auto / Specific Device / None-Off)
+    DesktopSensorToggles sensorToggles() const { return sensor_toggles_; }
+    void setLidarSelection(SensorSelectionMode mode) { sensor_toggles_.lidar_mode = mode; }
+    void setRgbSelection(SensorSelectionMode mode, const std::string& exact_name = "");
+    void setDepthSelection(SensorSelectionMode mode) { sensor_toggles_.depth_mode = mode; }
+    void setImuSelection(SensorSelectionMode mode, const std::string& imu_id = "");
+    void setGnssSelection(SensorSelectionMode mode) { sensor_toggles_.gnss_mode = mode; }
 
 private:
     static double steadyNowSec();
@@ -159,6 +186,8 @@ private:
     std::unique_ptr<sensors::AiryUdpReceiver> udp_receiver_;
     DesktopCameraCapture camera_;
     DesktopDepthCapture depth_capture_;
+    DesktopImuCapture host_imu_;
+    DesktopSensorToggles sensor_toggles_{};
 
     sync::TimeSynchronizer synchronizer_;
     slam::SensorAgnosticSlamEngine agnostic_engine_;
@@ -197,6 +226,7 @@ private:
     std::mutex mono_rgb_mutex_;
     std::deque<core::RgbFrame> standalone_rgb_queue_;
     std::deque<sensors::DepthFrame> standalone_depth_queue_;
+    std::deque<core::ImuMeasurement> standalone_imu_queue_;
     std::optional<sensors::GnssRtkMeasurement> pending_gnss_fix_;
     double last_lidar_arrival_sec_{0.0};
     uint64_t universal_seq_id_{0};

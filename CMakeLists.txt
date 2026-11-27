@@ -201,6 +201,7 @@ if(AVSLAM_BUILD_DESKTOP_APP AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
         desktop/DesktopSessionController.cpp
         desktop/DesktopCameraCapture.cpp
         desktop/DesktopDepthCapture.cpp
+        desktop/DesktopImuCapture.cpp
         ${imgui_SOURCE_DIR}/imgui.cpp
         ${imgui_SOURCE_DIR}/imgui_draw.cpp
         ${imgui_SOURCE_DIR}/imgui_tables.cpp
@@ -223,7 +224,7 @@ if(AVSLAM_BUILD_DESKTOP_APP AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
     )
 
     if(WIN32)
-        target_link_libraries(AVSlamDesktop PRIVATE mf mfplat mfreadwrite mfuuid ole32)
+        target_link_libraries(AVSlamDesktop PRIVATE mf mfplat mfreadwrite mfuuid ole32 sensorsapi portabledeviceguids)
     elseif(UNIX AND NOT APPLE)
         target_link_libraries(AVSlamDesktop PRIVATE pthread dl)
     endif()

@@ -121,18 +121,31 @@ bool DesktopSessionController::scanDirHasExistingData(const std::string& dir) {
 }
 
 std::string DesktopSessionController::autoScanLabelForActiveProfile() const {
-    if (active_universal_profile_id_ == "airy_standalone") return "Scan_Airy";
-    if (active_universal_profile_id_ == "orbbec_gemini_336l_standalone") return "Scan_336L";
-    if (active_universal_profile_id_ == "monocular_camera_standalone") return "Scan_Webcam";
-    if (active_universal_profile_id_ == "airy_monocular_cam") return "Scan_Airy_Webcam";
-    if (active_universal_profile_id_ == "scanar_v4_airy_336l") {
-        std::string ov = camera_.exactCameraNameOverride();
-        if (!ov.empty() && ov.find("Gemini") == std::string::npos && ov.find("Orbbec") == std::string::npos) {
-            return "Scan_Airy_Webcam";
+    const bool en_lidar = (sensor_toggles_.lidar_mode != SensorSelectionMode::DISABLED_NONE);
+    const bool en_rgb   = (sensor_toggles_.rgb_mode != SensorSelectionMode::DISABLED_NONE);
+    const bool en_depth = (sensor_toggles_.depth_mode != SensorSelectionMode::DISABLED_NONE);
+
+    std::string cam_tag = "Cam";
+    if (sensor_toggles_.rgb_mode == SensorSelectionMode::ENABLED_SPECIFIC) {
+        const auto& n = sensor_toggles_.rgb_device_name;
+        if (n.find("Surface") != std::string::npos || n.find("Webcam") != std::string::npos ||
+            (n.find("Gemini") == std::string::npos && n.find("Orbbec") == std::string::npos)) {
+            cam_tag = "Webcam";
+        } else {
+            cam_tag = "336L";
         }
-        return "Scan_Airy_336L";
+    } else if (en_depth) {
+        cam_tag = "336L";
+    } else {
+        cam_tag = "Webcam";
     }
-    return "Scan_" + sanitizeId(active_universal_profile_id_, "Agnostic");
+
+    if (en_lidar && en_depth) return "Scan_Airy_336L";
+    if (en_lidar && en_rgb)   return "Scan_Airy_" + cam_tag;
+    if (en_lidar)             return "Scan_Airy_Only";
+    if (en_depth)             return "Scan_336L_Only";
+    if (en_rgb)               return "Scan_" + cam_tag + "_Only";
+    return "Scan_Agnostic";
 }
 
 DesktopSessionController::DesktopSessionController() {
@@ -203,6 +216,11 @@ void DesktopSessionController::setupCallbacks() {
             }
         },
         [this](const core::ImuMeasurement& imu) {
+            if (sensor_toggles_.imu_mode == SensorSelectionMode::DISABLED_NONE) return;
+            if (sensor_toggles_.imu_mode == SensorSelectionMode::ENABLED_SPECIFIC &&
+                sensor_toggles_.imu_source_id != "airy_imu") {
+                return;
+            }
             double now = steadyNowSec();
             if (!is_terrestrial_active_.load()) {
                 synchronizer_.pushImu(imu, now);
@@ -243,6 +261,24 @@ void DesktopSessionController::setupCallbacks() {
             std::lock_guard<std::mutex> lk(mono_rgb_mutex_);
             standalone_depth_queue_.push_back(df);
             while (standalone_depth_queue_.size() > 4) standalone_depth_queue_.pop_front();
+        }
+    });
+
+    host_imu_.setImuCallback([this](const core::ImuMeasurement& imu) {
+        if (sensor_toggles_.imu_mode == SensorSelectionMode::DISABLED_NONE) return;
+        if (sensor_toggles_.imu_mode == SensorSelectionMode::ENABLED_SPECIFIC &&
+            sensor_toggles_.imu_source_id == "airy_imu") {
+            return;
+        }
+        if (!is_terrestrial_active_.load()) {
+            std::lock_guard<std::mutex> lk(mono_rgb_mutex_);
+            standalone_imu_queue_.push_back(imu);
+            while (standalone_imu_queue_.size() > 120) standalone_imu_queue_.pop_front();
+            // If user explicitly chose Host IMU while LiDAR is running, also feed synchronizer
+            if (sensor_toggles_.imu_mode == SensorSelectionMode::ENABLED_SPECIFIC &&
+                sensor_toggles_.imu_source_id != "airy_imu") {
+                synchronizer_.pushImu(imu, steadyNowSec());
+            }
         }
     });
 }
@@ -383,11 +419,71 @@ void DesktopSessionController::setUniversalSensorProfile(const std::string& univ
         if (up.profile_id == universal_profile_id) {
             active_universal_profile_id_ = up.profile_id;
             active_universal_profile_name_ = up.display_name;
+            // Sync per-sensor toggles to the chosen profile (user can still override any sensor individually!)
+            sensor_toggles_.lidar_mode = (up.expected_channels & slam::SENSOR_LIDAR)
+                ? SensorSelectionMode::AUTO : SensorSelectionMode::DISABLED_NONE;
+            sensor_toggles_.depth_mode = (up.expected_channels & slam::SENSOR_DEPTH_CAMERA)
+                ? SensorSelectionMode::AUTO : SensorSelectionMode::DISABLED_NONE;
+            if (up.expected_channels & slam::SENSOR_RGB_CAMERA) {
+                if (sensor_toggles_.rgb_mode == SensorSelectionMode::DISABLED_NONE) {
+                    sensor_toggles_.rgb_mode = SensorSelectionMode::AUTO;
+                }
+            } else {
+                sensor_toggles_.rgb_mode = SensorSelectionMode::DISABLED_NONE;
+            }
+            sensor_toggles_.imu_mode = SensorSelectionMode::AUTO;
+            sensor_toggles_.gnss_mode = up.supports_rtk_gps
+                ? SensorSelectionMode::AUTO : SensorSelectionMode::DISABLED_NONE;
             std::lock_guard<std::mutex> lock(state_mutex_);
             agnostic_engine_.setSensorRigConfig(up.rig_config);
             return;
         }
     }
+}
+
+void DesktopSessionController::selectCameraOverride(const std::string& exact_name) {
+    if (exact_name.empty()) {
+        setRgbSelection(SensorSelectionMode::AUTO, "");
+    } else {
+        setRgbSelection(SensorSelectionMode::ENABLED_SPECIFIC, exact_name);
+    }
+}
+
+void DesktopSessionController::setRgbSelection(SensorSelectionMode mode, const std::string& exact_name) {
+    sensor_toggles_.rgb_mode = mode;
+    sensor_toggles_.rgb_device_name = (mode == SensorSelectionMode::ENABLED_SPECIFIC) ? exact_name : "";
+    camera_.setExactCameraNameOverride(sensor_toggles_.rgb_device_name);
+}
+
+void DesktopSessionController::setImuSelection(SensorSelectionMode mode, const std::string& imu_id) {
+    sensor_toggles_.imu_mode = mode;
+    sensor_toggles_.imu_source_id = (mode == SensorSelectionMode::ENABLED_SPECIFIC) ? imu_id : "";
+}
+
+std::vector<DetectedImuInfo> DesktopSessionController::availableImuSources() const {
+    std::vector<DetectedImuInfo> out;
+    out.push_back({"airy_imu", "RoboSense Airy 200Hz IMU (Ethernet)", 100, true});
+    auto host_imus = host_imu_.enumerateAvailableImus();
+    out.insert(out.end(), host_imus.begin(), host_imus.end());
+    return out;
+}
+
+std::string DesktopSessionController::imuStatusSummary() const {
+    if (sensor_toggles_.imu_mode == SensorSelectionMode::DISABLED_NONE) return "OFF (None)";
+    if (sensor_toggles_.imu_mode == SensorSelectionMode::ENABLED_SPECIFIC &&
+        sensor_toggles_.imu_source_id == "airy_imu") {
+        return (udp_receiver_ && udp_receiver_->getPacketStats().imu_packets_valid > 0)
+            ? "ACTIVE: Airy 200Hz IMU" : "WAITING: Airy 200Hz IMU";
+    }
+    if (udp_receiver_ && udp_receiver_->getPacketStats().imu_packets_valid > 0 &&
+        sensor_toggles_.lidar_mode != SensorSelectionMode::DISABLED_NONE &&
+        sensor_toggles_.imu_mode == SensorSelectionMode::AUTO) {
+        return "AUTO -> Airy 200Hz IMU";
+    }
+    if (host_imu_.isRunning()) {
+        return host_imu_.statusSummary();
+    }
+    return "AUTO (Airy / Host IMU)";
 }
 
 slam::AgnosticSlamStatus DesktopSessionController::currentAgnosticStatus() const {
@@ -396,6 +492,7 @@ slam::AgnosticSlamStatus DesktopSessionController::currentAgnosticStatus() const
 }
 
 bool DesktopSessionController::injectNmeaGnssSentence(const std::string& nmea_gga) {
+    if (sensor_toggles_.gnss_mode == SensorSelectionMode::DISABLED_NONE) return false;
     sensors::GnssRtkMeasurement fix;
     if (!gnss_processor_.parseNmeaGga(nmea_gga, steadyNowSec(), fix)) return false;
     std::lock_guard<std::mutex> lock(state_mutex_);
@@ -460,13 +557,15 @@ bool DesktopSessionController::startScanning() {
         std::lock_guard<std::mutex> lk(mono_rgb_mutex_);
         standalone_rgb_queue_.clear();
         standalone_depth_queue_.clear();
+        standalone_imu_queue_.clear();
     }
 
-    const bool use_lidar = (active_universal_profile_id_ != "orbbec_gemini_336l_standalone" &&
-                            active_universal_profile_id_ != "monocular_camera_standalone");
-    const bool use_rgb = (active_universal_profile_id_ != "airy_standalone");
-    const bool use_depth = (active_universal_profile_id_ == "scanar_v4_airy_336l" ||
-                            active_universal_profile_id_ == "orbbec_gemini_336l_standalone");
+    const bool use_lidar = (sensor_toggles_.lidar_mode != SensorSelectionMode::DISABLED_NONE);
+    const bool use_rgb   = (sensor_toggles_.rgb_mode != SensorSelectionMode::DISABLED_NONE);
+    const bool use_depth = (sensor_toggles_.depth_mode != SensorSelectionMode::DISABLED_NONE);
+    const bool use_host_imu = (sensor_toggles_.imu_mode == SensorSelectionMode::AUTO) ||
+                              (sensor_toggles_.imu_mode == SensorSelectionMode::ENABLED_SPECIFIC &&
+                               sensor_toggles_.imu_source_id != "airy_imu");
 
     if (use_lidar) {
         fs::path raw_path = fs::path(active_scan_dir_) / (active_scan_id_ + "_raw.avraw");
@@ -478,6 +577,9 @@ bool DesktopSessionController::startScanning() {
     }
     if (use_depth) {
         depth_capture_.start();
+    }
+    if (use_host_imu) {
+        host_imu_.start(sensor_toggles_.imu_source_id);
     }
 
     is_scanning_.store(true);
@@ -493,6 +595,7 @@ void DesktopSessionController::stopScanning() {
     }
     camera_.stop();
     depth_capture_.stop();
+    host_imu_.stop();
     udp_receiver_->stopRawRecording();
     udp_receiver_->stop();
 }
@@ -522,7 +625,8 @@ void DesktopSessionController::slamWorkerLoop() {
             }
             have_bundle = true;
         } else if ((steadyNowSec() - last_lidar_arrival_sec_) > 0.25) {
-            // Sensor-agnostic fallback: run Depth-only (336L) or Monocular-only (Surface webcam / USB cam)!
+            // Sensor-agnostic fallback: run Depth-only (336L) or Monocular-only (Surface webcam / USB cam),
+            // automatically attaching Host/PC IMU samples when IMU is enabled!
             std::lock_guard<std::mutex> lk(mono_rgb_mutex_);
             if (!standalone_depth_queue_.empty()) {
                 u_bundle.sequence_id = ++universal_seq_id_;
@@ -533,12 +637,20 @@ void DesktopSessionController::slamWorkerLoop() {
                     u_bundle.rgb_frame = standalone_rgb_queue_.back();
                     standalone_rgb_queue_.clear();
                 }
+                if (sensor_toggles_.imu_mode != SensorSelectionMode::DISABLED_NONE && !standalone_imu_queue_.empty()) {
+                    u_bundle.imu_measurements.assign(standalone_imu_queue_.begin(), standalone_imu_queue_.end());
+                    standalone_imu_queue_.clear();
+                }
                 have_bundle = true;
             } else if (!standalone_rgb_queue_.empty()) {
                 u_bundle.sequence_id = ++universal_seq_id_;
                 u_bundle.rgb_frame = standalone_rgb_queue_.front();
                 u_bundle.timestamp_sec = u_bundle.rgb_frame->timestamp_sec;
                 standalone_rgb_queue_.pop_front();
+                if (sensor_toggles_.imu_mode != SensorSelectionMode::DISABLED_NONE && !standalone_imu_queue_.empty()) {
+                    u_bundle.imu_measurements.assign(standalone_imu_queue_.begin(), standalone_imu_queue_.end());
+                    standalone_imu_queue_.clear();
+                }
                 have_bundle = true;
             }
         }
